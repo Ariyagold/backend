@@ -7,12 +7,14 @@ import { config } from "../config.js";
 import { db } from "../db/client.js";
 import { publishers, webhookOutbox } from "../db/schema.js";
 import { getLogger } from "../lib/logger.js";
-import type { WebhookEvent } from "../schemas/webhooks.js";
+import { CURRENT_WEBHOOK_VERSION, type WebhookEvent } from "../schemas/webhooks.js";
 import { decryptWebhookSecret } from "../utils/crypto.js";
 
 export type { WebhookEvent } from "../schemas/webhooks.js";
+export { CURRENT_WEBHOOK_VERSION } from "../schemas/webhooks.js";
 
 export interface WebhookPayload {
+  version?: string;
   event: WebhookEvent | "webhook.test";
   timestamp: string;
   data: Record<string, unknown>;
@@ -231,7 +233,12 @@ export async function emitToPublisher(
     const target = await resolveTarget(publisherId);
     if (!target) return null;
     if (target.events.length > 0 && !target.events.includes(event)) return null;
-    return await deliver(target, { event, timestamp: new Date().toISOString(), data });
+    return await deliver(target, {
+      version: CURRENT_WEBHOOK_VERSION,
+      event,
+      timestamp: new Date().toISOString(),
+      data,
+    });
   } catch (err) {
     getLogger().error({ err, event: "webhook_emit_error", publisherId }, "webhook emit failed");
     return null;
@@ -258,6 +265,7 @@ export async function enqueueWebhookEvent(
     if (target.events.length > 0 && !target.events.includes(event)) return null;
 
     const payload: WebhookPayload = {
+      version: CURRENT_WEBHOOK_VERSION,
       event,
       timestamp: new Date().toISOString(),
       data,

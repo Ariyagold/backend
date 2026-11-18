@@ -62,6 +62,97 @@ async function releaseWorkerLeaderLock(): Promise<void> {
   }
 }
 
+let electionTimer: NodeJS.Timeout | null = null;
+let healthCheckTimer: NodeJS.Timeout | null = null;
+
+const ELECTION_RETRY_DELAY_MS = 5_000;
+const HEALTH_CHECK_INTERVAL_MS = 5_000;
+
+function startWorkers(): void {
+  if (workersStarted) return;
+  workersStarted = true;
+  rootLogger.info({ event: "workers_started_as_leader" }, "acquired worker leader lock; starting background workers");
+  startRetryPendingWorker();
+  startEventListener();
+  startWebhookOutboxWorker();
+  startLeaderHealthCheck();
+}
+
+function stopWorkers(): void {
+  if (!workersStarted) return;
+  workersStarted = false;
+  stopRetryPendingWorker();
+  stopEventListener();
+  stopWebhookOutboxWorker();
+  rootLogger.info({ event: "workers_stopped" }, "background workers stopped");
+}
+
+function startLeaderHealthCheck(): void {
+  if (healthCheckTimer) clearInterval(healthCheckTimer);
+  healthCheckTimer = setInterval(async () => {
+    if (shuttingDown || !workersStarted || !leaderConnection) {
+      if (healthCheckTimer) {
+        clearInterval(healthCheckTimer);
+        healthCheckTimer = null;
+      }
+      return;
+    }
+    try {
+      const [row] = await leaderConnection<{ held: boolean }[]>`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_locks
+          WHERE locktype = 'advisory'
+            AND objid = ${WORKER_LEADER_LOCK_ID}
+            AND pid = pg_backend_pid()
+        ) AS held
+      `;
+      if (!row?.held) {
+        throw new Error("Advisory lock no longer held on active leader session");
+      }
+    } catch (err) {
+      rootLogger.error(
+        { event: "worker_leader_session_lost", err },
+        "leader database session lost; stopping workers (#161)",
+      );
+      stopWorkers();
+      if (healthCheckTimer) {
+        clearInterval(healthCheckTimer);
+        healthCheckTimer = null;
+      }
+      try {
+        leaderConnection?.release();
+      } catch {}
+      leaderConnection = null;
+
+      // Resume standby election retry loop to re-acquire when DB is available (#160)
+      void scheduleElection();
+    }
+  }, HEALTH_CHECK_INTERVAL_MS);
+}
+
+function scheduleElection(delayMs = ELECTION_RETRY_DELAY_MS): void {
+  if (shuttingDown || !config.WORKERS_ENABLED || workersStarted) return;
+  if (electionTimer) clearTimeout(electionTimer);
+  electionTimer = setTimeout(async () => {
+    electionTimer = null;
+    await attemptLeaderElection();
+  }, delayMs);
+}
+
+async function attemptLeaderElection(): Promise<void> {
+  if (shuttingDown || !config.WORKERS_ENABLED || workersStarted) return;
+  const isLeader = await tryAcquireWorkerLeaderLock();
+  if (isLeader) {
+    startWorkers();
+  } else {
+    rootLogger.info(
+      { event: "workers_election_retry" },
+      "another instance holds the worker leader lock; standby retrying election after backoff (#160)",
+    );
+    scheduleElection();
+  }
+}
+
 async function startWorkersIfLeader(): Promise<void> {
   if (!config.WORKERS_ENABLED) {
     rootLogger.info(
@@ -70,21 +161,7 @@ async function startWorkersIfLeader(): Promise<void> {
     );
     return;
   }
-
-  const isLeader = await tryAcquireWorkerLeaderLock();
-  if (!isLeader) {
-    rootLogger.info(
-      { event: "workers_skipped_not_leader" },
-      "another instance holds the worker leader lock; skipping background workers",
-    );
-    return;
-  }
-
-  workersStarted = true;
-  rootLogger.info({ event: "workers_started_as_leader" }, "acquired worker leader lock; starting background workers");
-  startRetryPendingWorker();
-  startEventListener();
-  startWebhookOutboxWorker();
+  await attemptLeaderElection();
 }
 
 const server: Server = app.listen(config.PORT, () => {
@@ -108,11 +185,16 @@ async function gracefulShutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  if (workersStarted) {
-    stopRetryPendingWorker();
-    stopEventListener();
-    stopWebhookOutboxWorker();
+  if (electionTimer) {
+    clearTimeout(electionTimer);
+    electionTimer = null;
   }
+  if (healthCheckTimer) {
+    clearInterval(healthCheckTimer);
+    healthCheckTimer = null;
+  }
+
+  stopWorkers();
   stopPoolMetrics();
 
   // Stop passing readiness checks so load balancers drain us before we close.

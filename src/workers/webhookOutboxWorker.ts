@@ -6,12 +6,18 @@
  * the first attempt, a process crash during retries does not lose the event —
  * the next worker run picks it up where it left off.
  */
+import { and, count, eq, lte, min, sql } from "drizzle-orm";
 import { and, eq, lte, sql } from "drizzle-orm";
 import crypto from "node:crypto";
 import { db } from "../db/client.js";
 import { webhookOutbox } from "../db/schema.js";
 import { config } from "../config.js";
 import { getLogger } from "../lib/logger.js";
+import {
+  webhookOutboxPendingCount,
+  webhookOutboxOldestDueAgeSeconds,
+  webhookOutboxExhaustedTotal,
+} from "../lib/metrics.js";
 import { deliver } from "../services/webhookService.js";
 import { resolveTarget } from "../services/webhookService.js";
 import type { WebhookPayload } from "../services/webhookService.js";
@@ -43,6 +49,7 @@ async function tick(): Promise<void> {
   inFlight = true;
   try {
     await processPending();
+    await recordOutboxMetrics();
   } catch (err) {
     getLogger().error({ err, event: "webhook_outbox_tick_error" }, "webhook outbox worker tick failed");
   } finally {
@@ -130,6 +137,7 @@ async function processRow(row: typeof webhookOutbox.$inferSelect): Promise<void>
       { event: "webhook_outbox_exhausted", outboxId: row.id, publisherId: row.publisherId, error: result.error },
       "outbox webhook exhausted all attempts",
     );
+    webhookOutboxExhaustedTotal.inc();
     return;
   }
 
@@ -145,4 +153,33 @@ async function processRow(row: typeof webhookOutbox.$inferSelect): Promise<void>
     { event: "webhook_outbox_retry_scheduled", outboxId: row.id, attempt, nextAttemptAt },
     "outbox webhook retry scheduled",
   );
+}
+
+/**
+ * Collects persistent webhook delivery health measurements without publisher-ID labels (#158).
+ * Tracks pending count and the age in seconds of the oldest due pending delivery.
+ */
+export async function recordOutboxMetrics(): Promise<void> {
+  try {
+    const [stats] = await db
+      .select({
+        pendingCount: count(),
+        oldestNextAttempt: min(webhookOutbox.nextAttemptAt),
+      })
+      .from(webhookOutbox)
+      .where(eq(webhookOutbox.status, "pending"));
+
+    const pending = Number(stats?.pendingCount ?? 0);
+    webhookOutboxPendingCount.set(pending);
+
+    if (stats?.oldestNextAttempt) {
+      const oldestMs = new Date(stats.oldestNextAttempt).getTime();
+      const ageSeconds = Math.max(0, Math.floor((Date.now() - oldestMs) / 1000));
+      webhookOutboxOldestDueAgeSeconds.set(ageSeconds);
+    } else {
+      webhookOutboxOldestDueAgeSeconds.set(0);
+    }
+  } catch (err) {
+    getLogger().warn({ err, event: "webhook_outbox_metrics_error" }, "failed to record outbox metrics");
+  }
 }
