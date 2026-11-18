@@ -1,0 +1,48 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    labels:
+      - "dependencies"
+    groups:
+      framework:
+        patterns:
+          - "express"
+          - "fastify"
+          - "koa"
+          - "@nestjs/*"
+          - "hono"
+      cryptography:
+        patterns:
+          - "crypto*"
+          - "node-forge"
+          - "jose"
+          - "bcrypt*"
+          - "argon2"
+          - "tweetnacl"
+          - "@noble/*"
+      storage:
+        patterns:
+          - "pg"
+          - "mysql*"
+          - "sqlite*"
+          - "better-sqlite3"
+          - "drizzle-orm"
+          - "drizzle-kit"
+          - "redis"
+          - "ioredis"
+          - "@aws-sdk/*"
+          - "minio"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
