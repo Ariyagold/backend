@@ -21,7 +21,7 @@ describe("requestTimeout abort signal (#73)", () => {
     const req = { method: "POST", originalUrl: "/resources", url: "/resources" } as Request;
 
     const store = createTtlCache<IdempotencyRecord>({ defaultTtlMs: 60_000 });
-    store.set("p:k", { inProgress: true });
+    store.set("p:k", { inProgress: true, fingerprint: "fp" });
 
     requestTimeout(100)(req, res, vi.fn());
     const signal = getRequestSignal(res)!;
@@ -34,9 +34,10 @@ describe("requestTimeout abort signal (#73)", () => {
     // Handler finishes after the timeout: records the final outcome and skips
     // writing to the already-answered response.
     (res as any).headersSent = true;
-    store.set("p:k", { inProgress: false, result: { status: 201, body: { id: "r1" } } });
+    store.set("p:k", { inProgress: false, fingerprint: "fp", result: { status: 201, body: { id: "r1" } } });
     expect(store.get("p:k")).toEqual({
       inProgress: false,
+      fingerprint: "fp",
       result: { status: 201, body: { id: "r1" } },
     });
   });

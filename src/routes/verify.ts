@@ -103,11 +103,15 @@ async function checkResourceForVerification(req: Request, _res: Response, next: 
 router.post(
   "/verify-content",
   verifyIpRateLimit,
+  // Structural validation runs before any payment processing (#181): a
+  // malformed body (missing content, wrong types, a non-string resourceId)
+  // is rejected here, before facilitator verification or settlement is ever
+  // attempted, and before the DB lookup in checkResourceForVerification.
+  validate(verifyContentSchema),
   requireApiKeyForResource,
   checkResourceForVerification,
   verifyPaywall,
   verifyWalletRateLimit,
-  validate(verifyContentSchema),
   async (req, res) => {
     const { content, resourceId } = req.body;
 
@@ -136,59 +140,70 @@ router.post(
       "verification token usage",
     );
 
-    // If a resourceId is provided, save the verification result
+    // If a resourceId is provided, save the verification result. The
+    // verification row, its linked payment, and the resource status update
+    // commit as one transaction (#182): a failure partway through — e.g. the
+    // resource update failing a stale ownership/delist re-check — rolls back
+    // the verification and payment too, instead of leaving a verification or
+    // fee recorded with no matching resource state.
     if (resourceId) {
-      const [verification] = await db
-        .insert(verifications)
-        .values({
-          resourceId,
-          isOriginal: result.isOriginal,
-          confidence: result.confidence,
-          flags: JSON.stringify(result.flags),
-          promptTokens: usage.promptTokens,
-          completionTokens: usage.completionTokens,
-          totalTokens: usage.totalTokens,
-          estimatedCost: usage.estimatedCostUsd.toString(),
-        })
-        .returning();
-
-      // Record the verification fee so agent earnings come from settled
-      // payments rather than count × price (#99).
+      const shouldList = result.isOriginal && result.deterministicPassed;
       const paymentHeader = req.headers["x-payment"];
       const payer =
         typeof paymentHeader === "string" ? parsePayerFromXPayment(paymentHeader).payer : undefined;
-      const [payment] = await db
-        .insert(payments)
-        .values({
-          resourceId,
-          verificationId: verification.id,
-          payerAddress: payer ?? "unknown",
-          recipientAddress: config.PAY_TO,
-          amount: config.VERIFICATION_PRICE,
-        })
-        .returning({ id: payments.id });
-      recordSettlementOnFinish(res, payment.id);
 
-      // Update resource status — listing is independent of on-chain registration.
-      // Re-checks ownership and the admin delist so a change made since the
-      // pre-payment check can't be overwritten. A listing only goes live when
-      // the model approves *and* the deterministic check agrees (#96).
-      const shouldList = result.isOriginal && result.deterministicPassed;
-      const [updated] = await db
-        .update(resources)
-        .set({
-          verificationStatus: shouldList ? "verified" : "rejected",
-          verificationId: verification.id,
-          listed: shouldList,
-        })
-        .where(
-          and(
-            eq(resources.id, resourceId),
-            eq(resources.publisherId, req.publisher!.id),
-            isNull(resources.adminDelistedAt),
-          ),
-        )
-        .returning({ publisherId: resources.publisherId, title: resources.title });
+      const { payment, updated } = await db.transaction(async (tx) => {
+        const [verification] = await tx
+          .insert(verifications)
+          .values({
+            resourceId,
+            isOriginal: result.isOriginal,
+            confidence: result.confidence,
+            flags: JSON.stringify(result.flags),
+            promptTokens: usage.promptTokens,
+            completionTokens: usage.completionTokens,
+            totalTokens: usage.totalTokens,
+            estimatedCost: usage.estimatedCostUsd.toString(),
+          })
+          .returning();
+
+        // Record the verification fee so agent earnings come from settled
+        // payments rather than count × price (#99).
+        const [payment] = await tx
+          .insert(payments)
+          .values({
+            resourceId,
+            verificationId: verification.id,
+            payerAddress: payer ?? "unknown",
+            recipientAddress: config.PAY_TO,
+            amount: config.VERIFICATION_PRICE,
+          })
+          .returning({ id: payments.id });
+
+        // Update resource status — listing is independent of on-chain registration.
+        // Re-checks ownership and the admin delist so a change made since the
+        // pre-payment check can't be overwritten. A listing only goes live when
+        // the model approves *and* the deterministic check agrees (#96).
+        const [updated] = await tx
+          .update(resources)
+          .set({
+            verificationStatus: shouldList ? "verified" : "rejected",
+            verificationId: verification.id,
+            listed: shouldList,
+          })
+          .where(
+            and(
+              eq(resources.id, resourceId),
+              eq(resources.publisherId, req.publisher!.id),
+              isNull(resources.adminDelistedAt),
+            ),
+          )
+          .returning({ publisherId: resources.publisherId, title: resources.title });
+
+        return { payment, updated };
+      });
+
+      recordSettlementOnFinish(res, payment.id);
 
       if (updated && shouldList) {
         void enqueueWebhookEvent(updated.publisherId, "resource.listed", {
