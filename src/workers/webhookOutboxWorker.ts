@@ -95,7 +95,11 @@ async function processRow(row: typeof webhookOutbox.$inferSelect): Promise<void>
   }
 
   const payload = row.payload as WebhookPayload;
-  const result = await deliver(target, payload, { maxAttempts: 1 });
+  const deliveryId = row.deliveryId ?? `wh_${crypto.randomUUID().replaceAll("-", "")}`;
+  if (!row.deliveryId) {
+    await db.update(webhookOutbox).set({ deliveryId }).where(eq(webhookOutbox.id, row.id));
+  }
+  const result = await deliver(target, payload, { maxAttempts: 1, deliveryId });
 
   if (result.delivered) {
     await db
@@ -104,7 +108,7 @@ async function processRow(row: typeof webhookOutbox.$inferSelect): Promise<void>
         status: "delivered",
         attempts: attempt,
         deliveredAt: new Date(),
-        deliveryId: result.status !== undefined ? row.deliveryId : row.deliveryId,
+        deliveryId,
       })
       .where(eq(webhookOutbox.id, row.id));
 
@@ -117,7 +121,7 @@ async function processRow(row: typeof webhookOutbox.$inferSelect): Promise<void>
 
   // Delivery failed.
   const maxAttempts = row.maxAttempts;
-  if (attempt >= maxAttempts) {
+  if (result.retryable === false || attempt >= maxAttempts) {
     await db
       .update(webhookOutbox)
       .set({ status: "failed", attempts: attempt, lastError: result.error ?? "unknown error" })
@@ -127,11 +131,12 @@ async function processRow(row: typeof webhookOutbox.$inferSelect): Promise<void>
       { event: "webhook_outbox_exhausted", outboxId: row.id, publisherId: row.publisherId, error: result.error },
       "outbox webhook exhausted all attempts",
     );
+    webhookOutboxExhaustedTotal.inc();
     return;
   }
 
   // Schedule next attempt with exponential backoff.
-  const backoffMs = BASE_BACKOFF_MS * 2 ** attempt;
+  const backoffMs = result.retryAfterMs ?? BASE_BACKOFF_MS * 2 ** attempt;
   const nextAttemptAt = new Date(Date.now() + backoffMs);
   await db
     .update(webhookOutbox)

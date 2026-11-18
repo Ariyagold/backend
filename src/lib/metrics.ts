@@ -65,3 +65,52 @@ export const cacheMisses = new Counter({
   labelNames: ["cache"] as const,
   registers: [metricsRegistry],
 });
+
+// Webhook Outbox Metrics (#158)
+// Operational measurements specifically for persistent delivery health.
+// Note: Intentionally exported without publisher-ID labels to prevent high cardinality.
+export const webhookOutboxPendingCount = new Gauge({
+  name: "webhook_outbox_pending_count",
+  help: "Number of pending webhook outbox rows awaiting delivery",
+  registers: [metricsRegistry],
+});
+
+export const webhookOutboxOldestDueAgeSeconds = new Gauge({
+  name: "webhook_outbox_oldest_due_age_seconds",
+  help: "Age in seconds of the oldest due pending webhook outbox delivery",
+  registers: [metricsRegistry],
+});
+
+export const webhookOutboxExhaustedTotal = new Counter({
+  name: "webhook_outbox_exhausted_total",
+  help: "Total webhook outbox deliveries that exhausted all retry attempts (terminal failures)",
+  registers: [metricsRegistry],
+});
+
+/**
+ * Example Prometheus Alert Rules for Webhook Outbox (#158):
+ *
+ * 1. Sustained Backlog Alert:
+ * ```yaml
+ * - alert: WebhookOutboxSustainedBacklog
+ *   expr: webhook_outbox_oldest_due_age_seconds > 300
+ *   for: 5m
+ *   labels:
+ *     severity: warning
+ *   annotations:
+ *     summary: Webhook outbox has pending deliveries older than 5 minutes
+ *     description: Oldest due webhook outbox event has been pending for {{ $value }}s.
+ * ```
+ *
+ * 2. Terminal Failure Rate Alert:
+ * ```yaml
+ * - alert: WebhookOutboxTerminalFailuresElevated
+ *   expr: rate(webhook_outbox_exhausted_total[5m]) > 0.05
+ *   for: 5m
+ *   labels:
+ *     severity: critical
+ *   annotations:
+ *     summary: High rate of webhook deliveries exhausting maximum retry attempts
+ *     description: Webhook terminal failure rate is {{ $value }} failures/sec over 5m.
+ * ```
+ */
