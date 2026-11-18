@@ -4,6 +4,7 @@ const m = vi.hoisted(() => ({
   select: vi.fn(), set: vi.fn(), returning: vi.fn(), remove: vi.fn(),
   exists: vi.fn(), register: vi.fn(), send: vi.fn(), poll: vi.fn(),
   deleteFile: vi.fn(), downloadFile: vi.fn(), uploadFile: vi.fn(),
+  sharpToBuffer: vi.fn(),
 }));
 vi.mock("../db/client.js", () => ({ db: {
   select: m.select,
@@ -22,14 +23,19 @@ vi.mock("../storage/supabaseStorage.js", () => ({
 }));
 vi.mock("sharp", () => ({
   default: () => ({
-    resize: () => ({ jpeg: () => ({ toBuffer: () => Promise.resolve(Buffer.from("thumb")) }) }),
+    resize: () => ({ jpeg: () => ({ toBuffer: () => m.sharpToBuffer() }) }),
   }),
 }));
 import { startRetryPendingWorker, stopRetryPendingWorker } from "./retryPendingWorker.js";
 
+const orderByCalls: unknown[][] = [];
 function batch(registrations: unknown[] = [], cleanup: unknown[] = [], thumbnails: unknown[] = []) {
   for (const rows of [registrations, cleanup, thumbnails]) {
-    const chain = { where: () => chain, orderBy: () => chain, limit: () => Promise.resolve(rows) };
+    const chain = {
+      where: () => chain,
+      orderBy: (...args: unknown[]) => { orderByCalls.push(args); return chain; },
+      limit: () => Promise.resolve(rows),
+    };
     m.select.mockReturnValueOnce({ from: () => chain });
   }
 }
@@ -40,12 +46,14 @@ async function start() {
 }
 beforeEach(() => {
   vi.resetAllMocks();
+  orderByCalls.length = 0;
   vi.useFakeTimers();
   m.returning.mockResolvedValue([{ onchainAttempts: 1 }]);
   m.set.mockImplementation(() => ({ where: () => Object.assign(Promise.resolve(), { returning: m.returning }) }));
   m.exists.mockResolvedValue(false);
   m.register.mockResolvedValue({ signAndSend: m.send });
   m.send.mockResolvedValue({ sendTransactionResponse: { hash: "tx-hash" } });
+  m.sharpToBuffer.mockResolvedValue(Buffer.from("thumb"));
 });
 afterEach(() => {
   stopRetryPendingWorker();
@@ -58,6 +66,13 @@ describe("retryPendingWorker", () => {
     await start();
     expect(m.select).toHaveBeenCalledTimes(3);
     expect(m.register).not.toHaveBeenCalled();
+  });
+  it("orders the stale-registration query oldest-pending-first with id as tiebreaker (#169)", async () => {
+    batch();
+    await start();
+    // The first select is the stale-registration query; it orders by
+    // pending-since then id, unlike the single-column cleanup ordering.
+    expect(orderByCalls[0]).toHaveLength(2);
   });
   it("marks an existing on-chain resource registered", async () => {
     batch([resource]);
@@ -129,6 +144,27 @@ describe("retryPendingWorker", () => {
       { upsert: true },
     );
     expect(m.set).toHaveBeenCalledWith({ thumbnailPath: "res-1/thumb_file.png", thumbnailStatus: "ready" });
+  });
+  it("retries a transient storage fault instead of terminally failing the thumbnail (#167)", async () => {
+    batch([], [], [{ id: "res-1", storagePath: "res-1/file.png", mimeType: "image/png", thumbnailStatus: "pending", thumbnailAttempts: 0 }]);
+    m.downloadFile.mockRejectedValue(new Error("storage 503"));
+    await start();
+    expect(m.set).toHaveBeenCalledWith({ thumbnailAttempts: 1 });
+    expect(m.set).not.toHaveBeenCalledWith(expect.objectContaining({ thumbnailStatus: "failed" }));
+  });
+  it("fails the thumbnail once transient retries are exhausted", async () => {
+    batch([], [], [{ id: "res-1", storagePath: "res-1/file.png", mimeType: "image/png", thumbnailStatus: "pending", thumbnailAttempts: 4 }]);
+    m.downloadFile.mockRejectedValue(new Error("storage 503"));
+    await start();
+    expect(m.set).toHaveBeenCalledWith({ thumbnailStatus: "failed", thumbnailAttempts: 5 });
+  });
+  it("terminally fails a corrupt image without counting it as a transient attempt", async () => {
+    batch([], [], [{ id: "res-1", storagePath: "res-1/file.png", mimeType: "image/png", thumbnailStatus: "pending", thumbnailAttempts: 0 }]);
+    m.downloadFile.mockResolvedValue({ buffer: Buffer.from("not-an-image"), mimeType: "image/png" });
+    m.sharpToBuffer.mockRejectedValue(new Error("unsupported image format"));
+    await start();
+    expect(m.set).toHaveBeenCalledWith({ thumbnailStatus: "failed" });
+    expect(m.uploadFile).not.toHaveBeenCalled();
   });
   it("stops scheduling work after stop", async () => {
     batch();

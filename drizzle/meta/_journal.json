@@ -169,6 +169,27 @@
       "when": 1780400000012,
       "tag": "0019_constrain_attempt_budgets",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1780400000013,
+      "tag": "0020_thumbnail_attempts",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1780400000014,
+      "tag": "0021_stuck_registration_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1780400000015,
+      "tag": "0022_timestamptz",
+      "breakpoints": true
     }
   ]
 }
