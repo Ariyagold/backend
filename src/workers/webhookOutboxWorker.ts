@@ -7,6 +7,7 @@
  * the next worker run picks it up where it left off.
  */
 import { and, eq, lte, sql } from "drizzle-orm";
+import crypto from "node:crypto";
 import { db } from "../db/client.js";
 import { webhookOutbox } from "../db/schema.js";
 import { config } from "../config.js";
@@ -93,7 +94,11 @@ async function processRow(row: typeof webhookOutbox.$inferSelect): Promise<void>
   }
 
   const payload = row.payload as WebhookPayload;
-  const result = await deliver(target, payload, { maxAttempts: 1 });
+  const deliveryId = row.deliveryId ?? `wh_${crypto.randomUUID().replaceAll("-", "")}`;
+  if (!row.deliveryId) {
+    await db.update(webhookOutbox).set({ deliveryId }).where(eq(webhookOutbox.id, row.id));
+  }
+  const result = await deliver(target, payload, { maxAttempts: 1, deliveryId });
 
   if (result.delivered) {
     await db
@@ -102,7 +107,7 @@ async function processRow(row: typeof webhookOutbox.$inferSelect): Promise<void>
         status: "delivered",
         attempts: attempt,
         deliveredAt: new Date(),
-        deliveryId: result.status !== undefined ? row.deliveryId : row.deliveryId,
+        deliveryId,
       })
       .where(eq(webhookOutbox.id, row.id));
 
@@ -115,7 +120,7 @@ async function processRow(row: typeof webhookOutbox.$inferSelect): Promise<void>
 
   // Delivery failed.
   const maxAttempts = row.maxAttempts;
-  if (attempt >= maxAttempts) {
+  if (result.retryable === false || attempt >= maxAttempts) {
     await db
       .update(webhookOutbox)
       .set({ status: "failed", attempts: attempt, lastError: result.error ?? "unknown error" })
@@ -129,7 +134,7 @@ async function processRow(row: typeof webhookOutbox.$inferSelect): Promise<void>
   }
 
   // Schedule next attempt with exponential backoff.
-  const backoffMs = BASE_BACKOFF_MS * 2 ** attempt;
+  const backoffMs = result.retryAfterMs ?? BASE_BACKOFF_MS * 2 ** attempt;
   const nextAttemptAt = new Date(Date.now() + backoffMs);
   await db
     .update(webhookOutbox)
