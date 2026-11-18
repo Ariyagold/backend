@@ -51,7 +51,7 @@
     "@opentelemetry/sdk-node": "^0.217.0",
     "@opentelemetry/semantic-conventions": "^1.28.0",
     "@paralleldrive/cuid2": "^3.3.0",
-    "@sentry/node": "^10.62.0",
+    "@sentry/node": "^10.78.0",
     "@stellar/stellar-sdk": "^15.0.1",
     "@supabase/supabase-js": "^2.101.1",
     "@x402/core": "^2.9.0",
