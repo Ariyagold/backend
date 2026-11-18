@@ -189,9 +189,14 @@ async function processThumbnailJobs(): Promise<void> {
           .jpeg()
           .toBuffer();
 
-        // Must match the path GET /resources/:id/thumbnail reads.
+        // Must match the path GET /resources/:id/thumbnail reads. The path is
+        // deterministic per resource, so upsert makes retries after a crash
+        // between upload and the DB update below idempotent: re-uploading the
+        // same thumbnail overwrites the orphaned object instead of failing.
         const filename = resource.storagePath.split("/").pop();
-        const thumbnailPath = await uploadFile(resource.id, thumbnail, `thumb_${filename}`, "image/jpeg");
+        const thumbnailPath = await uploadFile(resource.id, thumbnail, `thumb_${filename}`, "image/jpeg", {
+          upsert: true,
+        });
 
         await db
           .update(resources)
@@ -244,6 +249,12 @@ async function retryResource(resource: typeof resources.$inferSelect): Promise<v
       return;
     }
 
+    // Fences every terminal write below: if another call for this resource
+    // (e.g. a fresh retryResource() started after this one timed out) has
+    // since bumped onchainAttempts, this write is stale and must no-op
+    // instead of overwriting the newer state (#164).
+    const fencedWhere = and(eq(resources.id, resource.id), eq(resources.onchainAttempts, attempts));
+
     if (resource.onchainTxHash) {
       // One immediate lookup; the next tick re-checks if it's still pending.
       const { status } = await pollTransactionStatus(resource.onchainTxHash, {
@@ -260,10 +271,7 @@ async function retryResource(resource: typeof resources.$inferSelect): Promise<v
       }
 
       if (status === "SUCCESS") {
-        await db
-          .update(resources)
-          .set({ onchainStatus: "registered" })
-          .where(eq(resources.id, resource.id));
+        await db.update(resources).set({ onchainStatus: "registered" }).where(fencedWhere);
         log.info(
           { event: "retry_confirmed", txHash: resource.onchainTxHash },
           "stored transaction confirmed; marking resource registered",
@@ -271,10 +279,7 @@ async function retryResource(resource: typeof resources.$inferSelect): Promise<v
         return;
       }
 
-      await db
-        .update(resources)
-        .set({ onchainStatus: "failed" })
-        .where(eq(resources.id, resource.id));
+      await db.update(resources).set({ onchainStatus: "failed" }).where(fencedWhere);
       log.warn(
         { event: "retry_tx_failed", txHash: resource.onchainTxHash },
         "stored transaction failed on-chain; marking resource failed",
@@ -288,10 +293,7 @@ async function retryResource(resource: typeof resources.$inferSelect): Promise<v
         { event: "retry_already_registered" },
         "resource already registered on-chain; updating DB",
       );
-      await db
-        .update(resources)
-        .set({ onchainStatus: "registered" })
-        .where(eq(resources.id, resource.id));
+      await db.update(resources).set({ onchainStatus: "registered" }).where(fencedWhere);
       return;
     }
 
@@ -305,10 +307,7 @@ async function retryResource(resource: typeof resources.$inferSelect): Promise<v
         { event: "retry_needs_client_signature" },
         "registration requires the creator's signature; marking failed for client resubmission",
       );
-      await db
-        .update(resources)
-        .set({ onchainStatus: "failed" })
-        .where(eq(resources.id, resource.id));
+      await db.update(resources).set({ onchainStatus: "failed" }).where(fencedWhere);
       return;
     }
 
@@ -348,7 +347,7 @@ async function retryResource(resource: typeof resources.$inferSelect): Promise<v
         onchainStatus: "registered",
         ...(txHash ? { onchainTxHash: txHash } : {}),
       })
-      .where(eq(resources.id, resource.id));
+      .where(fencedWhere);
 
     log.info(
       { event: "retry_success", txHash: txHash || undefined },
@@ -368,7 +367,7 @@ async function retryResource(resource: typeof resources.$inferSelect): Promise<v
       await db
         .update(resources)
         .set({ onchainStatus: "failed" })
-        .where(eq(resources.id, resource.id));
+        .where(and(eq(resources.id, resource.id), eq(resources.onchainAttempts, attempts)));
     }
   }
 }
