@@ -20,6 +20,11 @@ vi.mock("../services/registryClient.js", () => ({
 vi.mock("../storage/supabaseStorage.js", () => ({
   deleteFile: m.deleteFile, downloadFile: m.downloadFile, uploadFile: m.uploadFile,
 }));
+vi.mock("sharp", () => ({
+  default: () => ({
+    resize: () => ({ jpeg: () => ({ toBuffer: () => Promise.resolve(Buffer.from("thumb")) }) }),
+  }),
+}));
 import { startRetryPendingWorker, stopRetryPendingWorker } from "./retryPendingWorker.js";
 
 function batch(registrations: unknown[] = [], cleanup: unknown[] = [], thumbnails: unknown[] = []) {
@@ -110,6 +115,20 @@ describe("retryPendingWorker", () => {
     await start();
     expect(m.set).toHaveBeenCalledWith({ attempts: 2 });
     expect(m.remove).not.toHaveBeenCalled();
+  });
+  it("uploads thumbnails with upsert so a retry after a mid-flight crash recovers", async () => {
+    batch([], [], [{ id: "res-1", storagePath: "res-1/file.png", mimeType: "image/png", thumbnailStatus: "pending" }]);
+    m.downloadFile.mockResolvedValue({ buffer: Buffer.from("img"), mimeType: "image/png" });
+    m.uploadFile.mockResolvedValue("res-1/thumb_file.png");
+    await start();
+    expect(m.uploadFile).toHaveBeenCalledWith(
+      "res-1",
+      expect.any(Buffer),
+      "thumb_file.png",
+      "image/jpeg",
+      { upsert: true },
+    );
+    expect(m.set).toHaveBeenCalledWith({ thumbnailPath: "res-1/thumb_file.png", thumbnailStatus: "ready" });
   });
   it("stops scheduling work after stop", async () => {
     batch();
