@@ -15,6 +15,7 @@
     "start:prod": "NODE_ENV=production node dist/index.js",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
+    "db:check-schema": "tsx scripts/check-schema-drift.ts",
     "db:studio": "drizzle-kit studio",
     "migrate": "drizzle-kit migrate",
     "docker:build": "docker build -t synapsvault-backend:latest .",
@@ -27,8 +28,10 @@
     "e2e": "tsx scripts/e2e-test.ts",
     "reconcile": "tsx scripts/reconcile.ts",
     "seed": "tsx scripts/seed.ts",
+    "audit:storage-integrity": "tsx scripts/audit-storage-integrity.ts",
     "pretest": "npm run build:registry-client",
     "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:watch": "vitest",
     "typecheck:scripts": "tsc --ignoreConfig --noEmit --module nodenext --moduleResolution nodenext --target es2022 --strict --esModuleInterop --skipLibCheck --resolveJsonModule --types node scripts/*.ts"
   },

@@ -179,11 +179,16 @@ export const pendingCleanup = pgTable(
     storagePath: text("storage_path").notNull(),
     resourceId: text("resource_id").references(() => resources.id),
     attempts: integer("attempts").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).defaultNow().notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
-    // The cleanup worker drains the queue oldest-first.
+    // The cleanup worker polls the earliest due jobs first.
     createdAtIdx: index("idx_pending_cleanup_created_at").on(table.createdAt),
+    nextAttemptAtIdx: index("idx_pending_cleanup_next_attempt").on(
+      table.nextAttemptAt,
+      table.createdAt,
+    ),
     attemptsNonNegative: check("pending_cleanup_attempts_nonneg", sql`${table.attempts} >= 0`),
   }),
 );
@@ -332,11 +337,17 @@ export const moderationEvents = pgTable(
 );
 
 // Idempotency records shared across replicas (#71).
-export const idempotencyRecords = pgTable("idempotency_records", {
-  key: text("key").primaryKey(),
-  record: jsonb("record").notNull(),
-  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
-});
+export const idempotencyRecords = pgTable(
+  "idempotency_records",
+  {
+    key: text("key").primaryKey(),
+    record: jsonb("record").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  },
+  (table) => ({
+    expiresAtIdx: index("idx_idempotency_records_expires_at").on(table.expiresAt),
+  }),
+);
 
 // Webhook outbox — persists pending deliveries so they survive restarts (#48).
 // A background worker picks them up and retries with exponential backoff.
@@ -370,5 +381,7 @@ export const webhookOutbox = pgTable(
     publisherIdIdx: index("idx_webhook_outbox_publisher_id").on(table.publisherId, table.createdAt),
     // Retention cleanup queries terminal rows by status and delivered_at (#157).
     statusDeliveredIdx: index("idx_webhook_outbox_status_delivered").on(table.status, table.deliveredAt),
+    attemptsNonNegative: check("webhook_outbox_attempts_nonneg", sql`${table.attempts} >= 0`),
+    maxAttemptsPositive: check("webhook_outbox_max_attempts_positive", sql`${table.maxAttempts} > 0`),
   }),
 );
