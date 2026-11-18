@@ -108,9 +108,12 @@ export async function deliver(
   }
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Include DNS resolution in the overall per-attempt deadline (#154).
+    const attemptSignal = AbortSignal.timeout(config.WEBHOOK_TIMEOUT_MS);
+
     // Resolve hostname before each attempt to guard against DNS rebinding (#46).
     try {
-      const addrs = await resolveHostname(parsedUrl.hostname);
+      const addrs = await resolveHostname(parsedUrl.hostname, attemptSignal);
       const blocked = addrs.find((ip) => isPrivateIp(ip));
       if (blocked) {
         log.warn(
@@ -130,8 +133,15 @@ export async function deliver(
       continue;
     }
 
+    let res: Response | undefined;
     try {
-      const res = await requestPinned(parsedUrl, addrs[0], headers, body, config.WEBHOOK_TIMEOUT_MS);
+      res = await fetch(target.url, {
+        method: "POST",
+        headers,
+        body,
+        redirect: "manual",
+        signal: attemptSignal,
+      });
       lastStatus = res.status;
       if (res.status >= 200 && res.status < 300) {
         log.info({ event: "webhook_delivered", webhookEvent: payload.event, attempt }, "webhook delivered");
@@ -148,6 +158,10 @@ export async function deliver(
       }
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
+    } finally {
+      if (res) {
+        await releaseResponseBody(res);
+      }
     }
 
     log.warn({ event: "webhook_attempt_failed", webhookEvent: payload.event, attempt, error: lastError }, "webhook attempt failed");
@@ -319,11 +333,60 @@ export function isPrivateIp(ip: string): boolean {
 
 /**
  * Resolve the hostname of `url` and return all IP addresses. Throws when
- * the hostname cannot be resolved (#46).
+ * the hostname cannot be resolved or when the attempt signal times out (#46, #154).
  */
-export async function resolveHostname(hostname: string): Promise<string[]> {
-  const addrs = await dns.lookup(hostname, { all: true, family: 0 });
-  return addrs.map((a) => a.address);
+export async function resolveHostname(hostname: string, signal?: AbortSignal): Promise<string[]> {
+  if (signal?.aborted) {
+    throw signal.reason ?? new Error("DNS lookup timed out");
+  }
+
+  const lookupPromise = dns.lookup(hostname, { all: true, family: 0 }).then((addrs) => addrs.map((a) => a.address));
+  if (!signal) return lookupPromise;
+
+  return new Promise<string[]>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error("DNS lookup timed out"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    lookupPromise.then(
+      (res) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(res);
+      },
+      (err) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
+/**
+ * Releases resources associated with a fetch response body (#155).
+ * Drains up to 64KB so HTTP keep-alive connections can be reused,
+ * or cancels the body stream/reader.
+ */
+export async function releaseResponseBody(res: Response | { body?: unknown }): Promise<void> {
+  try {
+    if (!res || !res.body) return;
+    const body = res.body as any;
+    if (typeof body.cancel === "function" && typeof body.getReader === "function") {
+      const reader = body.getReader();
+      let bytesRead = 0;
+      try {
+        while (bytesRead < 64 * 1024) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytesRead += value ? (value.byteLength ?? value.length ?? 0) : 0;
+        }
+      } finally {
+        await reader.cancel().catch(() => {});
+        reader.releaseLock();
+      }
+    } else if (typeof body.cancel === "function") {
+      await body.cancel().catch(() => {});
+    }
+  } catch {
+    // Ignore errors during resource release
+  }
 }
 
 /**

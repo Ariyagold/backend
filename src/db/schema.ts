@@ -347,9 +347,7 @@ export const webhookOutbox = pgTable(
     statusNextIdx: index("idx_webhook_outbox_status_next").on(table.status, table.nextAttemptAt),
     // Publisher delivery-history endpoint queries by publisher_id + created_at.
     publisherIdIdx: index("idx_webhook_outbox_publisher_id").on(table.publisherId, table.createdAt),
-    attemptsNonNegative: check("webhook_outbox_attempts_nonneg", sql`${table.attempts} >= 0`),
-    // A zero or negative delivery budget would never retry, undermining the
-    // outbox's retry-with-backoff contract (#177).
-    maxAttemptsPositive: check("webhook_outbox_max_attempts_positive", sql`${table.maxAttempts} > 0`),
+    // Retention cleanup queries terminal rows by status and delivered_at (#157).
+    statusDeliveredIdx: index("idx_webhook_outbox_status_delivered").on(table.status, table.deliveredAt),
   }),
 );

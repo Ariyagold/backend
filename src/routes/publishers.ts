@@ -2,6 +2,7 @@ import { Router, type Router as RouterType } from "express";
 import type { z } from "zod/v4";
 import { AppError } from "../lib/errors.js";
 import { apiKeyAuth } from "../middleware/apiKeyAuth.js";
+import { requestSignatureAuth } from "../middleware/requestSignatureAuth.js";
 import { publisherRateLimit, registerIpRateLimit } from "../middleware/rateLimiters.js";
 import { validate } from "../middleware/validate.js";
 import {
@@ -11,6 +12,7 @@ import {
 } from "../schemas/requests.js";
 import { registerPublisher, getPublisherResources, rotateApiKey, rotateSigningSecret } from "../services/publisherService.js";
 import { deliver, webhookUrlProblem } from "../services/webhookService.js";
+import { replayWebhookDelivery } from "../workers/webhookOutboxWorker.js";
 import { eq, inArray, sum, count, sql, desc } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { publishers, resources, payments, webhookOutbox } from "../db/schema.js";
@@ -350,6 +352,33 @@ router.get("/publishers/me/webhooks/deliveries", apiKeyAuth, publisherRateLimit,
 
   res.json({ deliveries: rows });
 });
+
+// POST /publishers/me/webhooks/deliveries/:id/replay — replay a failed webhook delivery (#156)
+// Authenticated and signed; restricted to the owning publisher.
+router.post(
+  ["/publishers/me/webhooks/deliveries/:id/replay", "/publishers/me/webhooks/replay/:id"],
+  apiKeyAuth,
+  requestSignatureAuth,
+  publisherRateLimit,
+  async (req, res) => {
+    const pub = req.publisher!;
+    const deliveryId = req.params.id as string;
+    const replayed = await replayWebhookDelivery(deliveryId, pub.id);
+    res.json({
+      success: true,
+      delivery: {
+        id: replayed.id,
+        event: replayed.event,
+        status: replayed.status,
+        attempts: replayed.attempts,
+        maxAttempts: replayed.maxAttempts,
+        deliveryId: replayed.deliveryId,
+        nextAttemptAt: replayed.nextAttemptAt,
+        createdAt: replayed.createdAt,
+      },
+    });
+  },
+);
 
 // GET /publishers/leaderboard — public creator leaderboard
 router.get("/publishers/leaderboard", async (_req, res) => {
