@@ -20,6 +20,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIXTURES_DIR="${ROOT_DIR}/drizzle/fixtures"
 
+# Apply pending migrations using the journal-aware supported migrator.
+# Drizzle tracks applied migrations in its journal, so re-running is a no-op
+# for already-applied migrations (idempotent). Any failure propagates a
+# nonzero exit code and stops deployment.
 run_migrations() {
   echo "Applying migrations..."
   npx drizzle-kit migrate
