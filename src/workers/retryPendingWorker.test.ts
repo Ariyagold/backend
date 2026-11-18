@@ -128,7 +128,18 @@ describe("retryPendingWorker", () => {
     batch([], [{ id: "job", storagePath: "object", attempts: 1 }]);
     m.deleteFile.mockRejectedValue(new Error("storage down"));
     await start();
-    expect(m.set).toHaveBeenCalledWith({ attempts: 2 });
+    expect(m.set).toHaveBeenCalledWith(
+      expect.objectContaining({ attempts: 2, nextAttemptAt: expect.any(Date) }),
+    );
+    expect(m.remove).not.toHaveBeenCalled();
+  });
+  it("retains a failed cleanup job after the normal retry budget", async () => {
+    batch([], [{ id: "job", storagePath: "thumbnail", attempts: 4 }]);
+    m.deleteFile.mockRejectedValue(new Error("storage down"));
+    await start();
+    expect(m.set).toHaveBeenCalledWith(
+      expect.objectContaining({ attempts: 5, nextAttemptAt: expect.any(Date) }),
+    );
     expect(m.remove).not.toHaveBeenCalled();
   });
   it("uploads thumbnails with upsert so a retry after a mid-flight crash recovers", async () => {

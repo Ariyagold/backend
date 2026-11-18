@@ -79,5 +79,9 @@ export async function downloadFile(
 
 export async function deleteFile(storagePath: string): Promise<void> {
   const { error } = await supabase.storage.from(bucket).remove([storagePath]);
-  if (error) throw new Error(`Delete failed: ${error.message}`);
+  if (!error) return;
+
+  const statusCode = (error as { statusCode?: number | string }).statusCode;
+  if (String(statusCode) === "404" || /not\s*found/i.test(error.message ?? "")) return;
+  throw new Error(`Delete failed: ${error.message}`);
 }

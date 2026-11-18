@@ -73,6 +73,10 @@ cp .env.example .env
 # validates config on boot and exits listing anything missing.
 
 npm run db:migrate   # apply drizzle migrations
+npm run db:check-schema # compare the migrated database with src/db/schema.ts
+# Use a dedicated, disposable database for this Postgres-backed suite.
+npm run test:integration # run against the migrated database in DATABASE_URL
+npm run audit:storage-integrity -- --limit 500 --dry-run # report missing or changed stored files
 npm run dev          # dev server with hot reload (default port 4021)
 
 npm run typecheck

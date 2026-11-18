@@ -136,7 +136,8 @@ async function processCleanupJobs(): Promise<void> {
     const jobs = await db
       .select()
       .from(pendingCleanup)
-      .orderBy(asc(pendingCleanup.createdAt))
+      .where(lt(pendingCleanup.nextAttemptAt, sql`NOW()`))
+      .orderBy(asc(pendingCleanup.nextAttemptAt), asc(pendingCleanup.createdAt))
       .limit(config.RETRY_WORKER_BATCH_SIZE);
 
     for (const job of jobs) {
@@ -149,23 +150,27 @@ async function processCleanupJobs(): Promise<void> {
         );
       } catch (err: any) {
         const attempts = job.attempts + 1;
+        const retryDelayMs = Math.min(60_000 * 2 ** (attempts - 1), 60 * 60_000);
+        await db
+          .update(pendingCleanup)
+          .set({
+            attempts,
+            nextAttemptAt: new Date(Date.now() + retryDelayMs),
+          })
+          .where(eq(pendingCleanup.id, job.id));
+
         if (attempts >= MAX_CLEANUP_ATTEMPTS) {
-          await db.delete(pendingCleanup).where(eq(pendingCleanup.id, job.id));
           log.error(
             {
-              event: "cleanup_job_dropped",
+              event: "cleanup_job_retrying",
               jobId: job.id,
               storagePath: job.storagePath,
               attempts,
               err: err?.message ?? String(err),
             },
-            "pending cleanup job dropped after max attempts",
+            "pending cleanup job retained for retry after repeated failures",
           );
         } else {
-          await db
-            .update(pendingCleanup)
-            .set({ attempts })
-            .where(eq(pendingCleanup.id, job.id));
           log.warn(
             {
               event: "cleanup_job_failed",

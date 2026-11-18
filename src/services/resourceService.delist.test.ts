@@ -118,6 +118,21 @@ describe("delistResource on-chain sync (#218)", () => {
     expect(injected).toHaveBeenCalledWith("r4");
   });
 
+  it("deletes the derived thumbnail as well as the original file", async () => {
+    returnedRow = {
+      id: "r4-thumb",
+      onchainStatus: "none",
+      storagePath: "r4-thumb/file.png",
+      thumbnailPath: "r4-thumb/thumb_file.png",
+    };
+
+    await delistResource("r4-thumb", "pub1");
+
+    expect(deleteFile).toHaveBeenCalledTimes(2);
+    expect(deleteFile).toHaveBeenNthCalledWith(1, "r4-thumb/file.png");
+    expect(deleteFile).toHaveBeenNthCalledWith(2, "r4-thumb/thumb_file.png");
+  });
+
   it("still resolves the delist when storage deletion fails, logging and queueing cleanup", async () => {
     returnedRow = { id: "r5", onchainStatus: "registered", storagePath: "r5/file.pdf" };
     deleteFile.mockImplementation(() =>
