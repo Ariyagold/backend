@@ -14,6 +14,12 @@ import {
 import { sql } from "drizzle-orm";
 import { createId } from "@paralleldrive/cuid2";
 
+// All timestamp columns are `timestamptz` (#178): every row this app has
+// ever written was produced by `defaultNow()` or `new Date()` on a
+// connection running in UTC (see drizzle/0020_timestamptz.sql), so the
+// historical `timestamp without time zone` values are UTC wall-clock times.
+// The migration reinterprets them as such (`AT TIME ZONE 'UTC'`) rather than
+// the session's zone, which is what makes the conversion lossless.
 export const resourceTypeEnum = pgEnum("resource_type", ["file", "link"]);
 
 export const verificationStatusEnum = pgEnum("verification_status", [
@@ -69,8 +75,8 @@ export const publishers = pgTable(
     signingSecret: text("signing_secret"),
     // Set when the publisher rotates their API key. Any key whose hash matches
     // a row with a non-null api_key_revoked_at is rejected by apiKeyAuth (#40).
-    apiKeyRevokedAt: timestamp("api_key_revoked_at"),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
+    apiKeyRevokedAt: timestamp("api_key_revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
     // Every authenticated request looks up a publisher by api_key_hash.
@@ -100,6 +106,9 @@ export const resources = pgTable(
     // Thumbnail generation state so the background worker can pick up
     // resources that still need a thumbnail (#89).
     thumbnailStatus: thumbnailStatusEnum("thumbnail_status").notNull().default("none"),
+    // Transient-storage-fault retries so far; corrupt/unsupported images skip
+    // this and fail immediately instead of incrementing it (#167).
+    thumbnailAttempts: integer("thumbnail_attempts").notNull().default(0),
     contentHash: text("content_hash"),
     externalUrl: text("external_url"),
     mimeType: text("mime_type"),
@@ -108,7 +117,7 @@ export const resources = pgTable(
     listed: boolean("listed").notNull().default(false),
     // Set when an administrator delists the resource. Publisher-initiated
     // delists leave it null. Blocks relisting via POST /verify-content (#18).
-    adminDelistedAt: timestamp("admin_delisted_at"),
+    adminDelistedAt: timestamp("admin_delisted_at", { withTimezone: true }),
     onchainStatus: onchainStatusEnum("onchain_status").notNull().default("none"),
     onchainTxHash: text("onchain_tx_hash"),
     // Number of on-chain registration attempts made so far. Persisted so the
@@ -120,10 +129,10 @@ export const resources = pgTable(
     // Set when onchainStatus transitions to "pending". The retry worker uses
     // this (not createdAt) for its cutoff so a freshly pending old resource
     // isn't retried before a live registration can finish (#82).
-    onchainPendingSince: timestamp("onchain_pending_since"),
+    onchainPendingSince: timestamp("onchain_pending_since", { withTimezone: true }),
     // Tags set on-chain via SET_TAGS events (#103). Null means never synced.
     tags: text("tags").array(),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
     catalogFilterSortIdx: index("idx_resources_catalog_filter_sort").on(
@@ -138,10 +147,22 @@ export const resources = pgTable(
     verificationStatusIdx: index("idx_resources_verification_status").on(table.verificationStatus),
     // The thumbnail worker polls for resources awaiting generation (#89).
     thumbnailStatusIdx: index("idx_resources_thumbnail_status").on(table.thumbnailStatus),
+    // The stale-registration query filters on status + pending-since and
+    // orders oldest-first with id as a tiebreaker; this composite index
+    // covers both the filter and the sort (#169).
+    stuckRegistrationIdx: index("idx_resources_stuck_registration").on(
+      table.onchainStatus,
+      table.onchainPendingSince,
+      table.id,
+    ),
     // Retry-state assumption: attempts never go negative (#177).
     onchainAttemptsNonNegative: check(
       "resources_onchain_attempts_nonneg",
       sql`${table.onchainAttempts} >= 0`,
+    ),
+    thumbnailAttemptsNonNegative: check(
+      "resources_thumbnail_attempts_nonneg",
+      sql`${table.thumbnailAttempts} >= 0`,
     ),
   }),
 );
@@ -158,7 +179,7 @@ export const pendingCleanup = pgTable(
     storagePath: text("storage_path").notNull(),
     resourceId: text("resource_id").references(() => resources.id),
     attempts: integer("attempts").notNull().default(0),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
     // The cleanup worker drains the queue oldest-first.
@@ -186,7 +207,7 @@ export const verifications = pgTable(
     completionTokens: integer("completion_tokens"),
     totalTokens: integer("total_tokens"),
     estimatedCost: text("estimated_cost"), // USD, stringified for precision
-    checkedAt: timestamp("checked_at").defaultNow().notNull(),
+    checkedAt: timestamp("checked_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
     // /agent/status fetches the most recent verifications for its activity
@@ -236,7 +257,7 @@ export const payments = pgTable(
     // Settlement state of the payment. Only settled payments count toward
     // earnings (#99).
     status: paymentStatusEnum("status").notNull().default("pending"),
-    paidAt: timestamp("paid_at").defaultNow().notNull(),
+    paidAt: timestamp("paid_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
     // Payment history is queried per payer wallet (#285).
@@ -263,7 +284,7 @@ export const failedEvents = pgTable(
     payload: text("payload").notNull(), // JSON stringified event payload
     error: text("error").notNull(),
     attempts: integer("attempts").notNull().default(1),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
     eventIdIdx: index("idx_failed_events_event_id").on(table.eventId),
@@ -281,7 +302,7 @@ export const ledgerCheckpoints = pgTable("ledger_checkpoints", {
   // resumes from another contract's ledger.
   contractId: text("contract_id").primaryKey(),
   lastLedger: integer("last_ledger").notNull(),
-  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
 // Moderation events — immutable audit log of admin actions on resources (#50).
@@ -302,7 +323,7 @@ export const moderationEvents = pgTable(
     reason: text("reason"),
     // Identifier of the actor (admin key digest or "admin" when unset).
     actor: text("actor").notNull(),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
     // Fast lookup of all moderation events for a given resource.
@@ -314,7 +335,7 @@ export const moderationEvents = pgTable(
 export const idempotencyRecords = pgTable("idempotency_records", {
   key: text("key").primaryKey(),
   record: jsonb("record").notNull(),
-  expiresAt: timestamp("expires_at").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
 });
 
 // Webhook outbox — persists pending deliveries so they survive restarts (#48).
@@ -338,9 +359,9 @@ export const webhookOutbox = pgTable(
     // Stable delivery ID echoed in X-SynapsVault-Id (#45).
     deliveryId: text("delivery_id"),
     // Worker polls for rows where next_attempt_at <= now() and status = 'pending'.
-    nextAttemptAt: timestamp("next_attempt_at").defaultNow().notNull(),
-    deliveredAt: timestamp("delivered_at"),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).defaultNow().notNull(),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
     // Worker polls pending rows ordered by next_attempt_at.

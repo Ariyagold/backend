@@ -42,20 +42,27 @@ export async function adminDelistResource(
   id: string,
   options: { reason?: string; actor?: string } = {},
 ) {
-  const [resource] = await db
-    .update(resources)
-    .set({ listed: false, adminDelistedAt: new Date() })
-    .where(eq(resources.id, id))
-    .returning({ id: resources.id });
-  if (!resource) return null;
+  // The delist and its audit record commit atomically (#179): if the audit
+  // insert fails, the transaction rolls back the delist too, so there is
+  // never a committed moderation action without its durable audit record.
+  const resource = await db.transaction(async (tx) => {
+    const [updated] = await tx
+      .update(resources)
+      .set({ listed: false, adminDelistedAt: new Date() })
+      .where(eq(resources.id, id))
+      .returning({ id: resources.id });
+    if (!updated) return null;
 
-  // Write an immutable audit record so the moderation action is reviewable (#50).
-  await db.insert(moderationEvents).values({
-    resourceId: resource.id,
-    action: "admin_delist",
-    reason: options.reason ?? null,
-    actor: options.actor ?? "admin",
+    await tx.insert(moderationEvents).values({
+      resourceId: updated.id,
+      action: "admin_delist",
+      reason: options.reason ?? null,
+      actor: options.actor ?? "admin",
+    });
+
+    return updated;
   });
+  if (!resource) return null;
 
   invalidateReads(resource.id);
   return resource;

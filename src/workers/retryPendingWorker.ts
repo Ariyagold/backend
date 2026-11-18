@@ -18,6 +18,17 @@ const WORKER_INTERVAL_MS = 60_000;
 const MAX_RETRY_ATTEMPTS = 3;
 const MAX_CLEANUP_ATTEMPTS = 5;
 const THUMBNAIL_WIDTH = 320;
+const MAX_THUMBNAIL_ATTEMPTS = 5;
+
+// Marks an error as a storage-layer fault (network blip, 5xx, timeout) rather
+// than bad image data, so the thumbnail pass can retry it instead of
+// terminally failing the resource (#167).
+class TransientThumbnailError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "TransientThumbnailError";
+  }
+}
 
 let intervalHandle: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
@@ -72,6 +83,10 @@ async function processStuckRegistrations(): Promise<void> {
           lt(resources.onchainPendingSince, cutoff),
         ),
       )
+      // Oldest-pending-first, with id as a tiebreaker for rows sharing a
+      // timestamp, so older eligible work always progresses ahead of newer
+      // work within a batch (#169).
+      .orderBy(asc(resources.onchainPendingSince), asc(resources.id))
       .limit(config.RETRY_WORKER_BATCH_SIZE);
 
     if (stuck.length === 0) return;
@@ -182,8 +197,18 @@ async function processThumbnailJobs(): Promise<void> {
       const rlog = log.child({ resourceId: resource.id });
       try {
         if (!resource.storagePath) throw new Error("resource has no stored file");
-        const original = await downloadFile(resource.storagePath);
+
+        let original: Awaited<ReturnType<typeof downloadFile>>;
+        try {
+          original = await downloadFile(resource.storagePath);
+        } catch (err) {
+          throw new TransientThumbnailError(err);
+        }
+
         // limitInputPixels rejects decompression bombs before decoding (#89).
+        // Decode/resize/encode failures are the image's fault (corrupt or
+        // unsupported format), not storage, so they're left untagged and
+        // terminate the job below instead of being retried (#167).
         const thumbnail = await sharp(original.buffer, { limitInputPixels: MAX_THUMBNAIL_PIXELS })
           .resize({ width: THUMBNAIL_WIDTH, withoutEnlargement: true })
           .jpeg()
@@ -194,9 +219,14 @@ async function processThumbnailJobs(): Promise<void> {
         // between upload and the DB update below idempotent: re-uploading the
         // same thumbnail overwrites the orphaned object instead of failing.
         const filename = resource.storagePath.split("/").pop();
-        const thumbnailPath = await uploadFile(resource.id, thumbnail, `thumb_${filename}`, "image/jpeg", {
-          upsert: true,
-        });
+        let thumbnailPath: string;
+        try {
+          thumbnailPath = await uploadFile(resource.id, thumbnail, `thumb_${filename}`, "image/jpeg", {
+            upsert: true,
+          });
+        } catch (err) {
+          throw new TransientThumbnailError(err);
+        }
 
         await db
           .update(resources)
@@ -208,6 +238,32 @@ async function processThumbnailJobs(): Promise<void> {
           "thumbnail generated",
         );
       } catch (err: any) {
+        if (err instanceof TransientThumbnailError) {
+          const thumbnailAttempts = (resource.thumbnailAttempts ?? 0) + 1;
+          if (thumbnailAttempts >= MAX_THUMBNAIL_ATTEMPTS) {
+            await db
+              .update(resources)
+              .set({ thumbnailStatus: "failed", thumbnailAttempts })
+              .where(eq(resources.id, resource.id));
+            rlog.error(
+              { event: "thumbnail_retry_exhausted", thumbnailAttempts, err: err.message },
+              "thumbnail retries exhausted after repeated transient storage faults",
+            );
+          } else {
+            // Leave thumbnailStatus "pending" so the next tick's query picks
+            // this resource back up.
+            await db
+              .update(resources)
+              .set({ thumbnailAttempts })
+              .where(eq(resources.id, resource.id));
+            rlog.warn(
+              { event: "thumbnail_transient_failure", thumbnailAttempts, err: err.message },
+              "transient storage fault generating thumbnail; will retry",
+            );
+          }
+          continue;
+        }
+
         await db
           .update(resources)
           .set({ thumbnailStatus: "failed" })

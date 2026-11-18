@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { moderationEvents as moderationEventsTable } from "../db/schema.js";
 
 // Captures the values passed to `.set(...)` on the update chain.
 const { setCalls, returnedRows } = vi.hoisted(() => ({
@@ -13,11 +14,18 @@ const { insertedRows, deletedIds, insertValues } = vi.hoisted(() => ({
   insertValues: [] as Array<Record<string, unknown>>,
 }));
 
-vi.mock("../db/client.js", () => ({
-  db: {
+// Toggle to make the moderation_events insert reject, to exercise the
+// transaction rollback path (#179).
+const { insertShouldFail } = vi.hoisted(() => ({ insertShouldFail: { value: false } }));
+
+function makeDbMethods(
+  setSink: Array<Record<string, unknown>> = setCalls,
+  insertSink: Array<Record<string, unknown>> = insertValues,
+) {
+  return {
     update: () => ({
       set: (values: Record<string, unknown>) => {
-        setCalls.push(values);
+        setSink.push(values);
         return {
           where: () => ({
             returning: () => Promise.resolve(returnedRows.rows),
@@ -25,9 +33,12 @@ vi.mock("../db/client.js", () => ({
         };
       },
     }),
-    insert: () => ({
+    insert: (table: unknown) => ({
       values: (values: Record<string, unknown>) => {
-        insertValues.push(values);
+        if (insertShouldFail.value && table === moderationEventsTable) {
+          return Promise.reject(new Error("audit insert boom"));
+        }
+        insertSink.push(values);
         return {
           returning: () => Promise.resolve(insertedRows.rows),
         };
@@ -39,6 +50,25 @@ vi.mock("../db/client.js", () => ({
         return Promise.resolve();
       },
     }),
+  };
+}
+
+vi.mock("../db/client.js", () => ({
+  db: {
+    ...makeDbMethods(),
+    // Mimics drizzle's real transaction semantics closely enough for these
+    // tests: the callback writes into its own pending buffers, which only
+    // land in setCalls/insertValues (i.e. "commit") if the callback doesn't
+    // throw. A throw propagates and discards the pending buffers (#179).
+    transaction: async (cb: (tx: ReturnType<typeof makeDbMethods>) => Promise<unknown>) => {
+      const pendingSetCalls: Array<Record<string, unknown>> = [];
+      const pendingInsertValues: Array<Record<string, unknown>> = [];
+      const tx = makeDbMethods(pendingSetCalls, pendingInsertValues);
+      const result = await cb(tx);
+      setCalls.push(...pendingSetCalls);
+      insertValues.push(...pendingInsertValues);
+      return result;
+    },
   },
 }));
 
@@ -95,6 +125,7 @@ describe("adminDelistResource", () => {
     setCalls.length = 0;
     insertValues.length = 0;
     returnedRows.rows = [];
+    insertShouldFail.value = false;
   });
 
   it("delists and stamps adminDelistedAt so the resource cannot be relisted", async () => {
@@ -141,6 +172,16 @@ describe("adminDelistResource", () => {
     returnedRows.rows = [];
 
     expect(await adminDelistResource("missing")).toBeNull();
+  });
+
+  it("commits neither the delist nor the audit row when the audit insert fails (#179)", async () => {
+    returnedRows.rows = [{ id: "res-4" }];
+    insertShouldFail.value = true;
+
+    await expect(adminDelistResource("res-4")).rejects.toThrow("audit insert boom");
+
+    expect(setCalls).toHaveLength(0);
+    expect(insertValues).toHaveLength(0);
   });
 });
 
