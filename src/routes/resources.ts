@@ -34,9 +34,14 @@ import { and, eq, inArray } from "drizzle-orm";
 import { config } from "../config.js";
 import { getLogger } from "../lib/logger.js";
 import { publishIpRateLimit, publishWalletRateLimit } from "../middleware/rateLimiters.js";
-import { IDEMPOTENCY_IN_PROGRESS_TTL_MS } from "../lib/idempotency.js";
-import { getIdempotencyStore, idempotencyCacheKey } from "../lib/idempotency.js";
+import {
+  IDEMPOTENCY_IN_PROGRESS_TTL_MS,
+  computeIdempotencyFingerprint,
+  getIdempotencyStore,
+  idempotencyCacheKey,
+} from "../lib/idempotency.js";
 import { parseIdempotencyKey } from "../lib/idempotencyKey.js";
+import { calculateContentHash } from "../utils/crypto.js";
 import { decodeNewCreator, decodeSetPrice } from "../services/signedTxDecode.js";
 import { getRequestSignal } from "../lib/requestAbort.js";
 import { buildRegistrationFailureGuidance, explorerTxUrl } from "../lib/registrationGuidance.js";
@@ -106,36 +111,81 @@ router.post(
     const idemKey = parseIdempotencyKey(req.header("Idempotency-Key"));
     const store = getIdempotencyStore();
     const scopedKey = idemKey ? idempotencyCacheKey(publisher.id, idemKey) : null;
-
-    if (scopedKey) {
-      const existing = await store.get(scopedKey);
-      if (existing) {
-        if (existing.inProgress) {
-          // A concurrent request with the same key is still running.
-          throw new AppError("CONFLICT", "Idempotent request already in progress");
-        }
-        res.status(existing.result.status).json(existing.result.body);
-        return;
-      }
-      await store.set(scopedKey, { inProgress: true }, IDEMPOTENCY_IN_PROGRESS_TTL_MS);
-    }
-
-    // Records the final result under the idempotency key (when keyed), then responds.
-    const sendResult = async (status: number, body: unknown) => {
-      if (scopedKey) await store.set(scopedKey, { inProgress: false, result: { status, body } });
-      // After a request timeout (#73) the 503 is already sent; the final
-      // outcome is still recorded above so retries see it.
-      if (!res.headersSent) res.status(status).json(body);
-    };
+    // True once this request has actually claimed scopedKey's reservation.
+    // Only then is it this request's to release on failure — a conflict
+    // from someone else's live reservation must never delete their record.
+    let ownsReservation = false;
 
     try {
+      if (getRequestSignal(res)?.aborted) {
+        // Timed out before any work started (#73); nothing was reserved yet.
+        return;
+      }
+
+      // Read once, up front, so both the fingerprint (below) and the later
+      // upload use the same bytes instead of reading the temp file twice.
+      const fileBuffer = req.file ? await fs.readFile(req.file.path) : null;
+
+      // Canonical fingerprint of the request content (#171). Computed before
+      // the reservation below so reusing a key with different metadata or
+      // file bytes is rejected as a conflict instead of racing to either
+      // replay or overwrite an unrelated result.
+      const fingerprint = scopedKey
+        ? computeIdempotencyFingerprint({
+            title: req.body?.title,
+            description: req.body?.description,
+            price: req.body?.price,
+            walletAddress: req.body?.walletAddress,
+            externalUrl: req.body?.externalUrl,
+            fileContentHash: fileBuffer ? calculateContentHash(fileBuffer) : undefined,
+            filename: req.file?.originalname,
+            mimeType: req.file?.mimetype,
+          })
+        : "";
+
+      if (scopedKey) {
+        // Atomic reserve-or-read (#170): only one concurrent request with
+        // this key claims it; every other request observes the claimant's
+        // record instead of racing a separate get()-then-set().
+        const existing = await store.reserve(
+          scopedKey,
+          { inProgress: true, fingerprint },
+          IDEMPOTENCY_IN_PROGRESS_TTL_MS,
+        );
+        if (existing) {
+          if (existing.fingerprint !== fingerprint) {
+            throw new AppError(
+              "CONFLICT",
+              "Idempotency-Key was already used with a different request",
+            );
+          }
+          if (existing.inProgress) {
+            // A concurrent request with the same key is still running.
+            throw new AppError("CONFLICT", "Idempotent request already in progress");
+          }
+          res.status(existing.result.status).json(existing.result.body);
+          return;
+        }
+        ownsReservation = true;
+      }
+
+      // Records the final result under the idempotency key (when keyed), then responds.
+      const sendResult = async (status: number, body: unknown) => {
+        if (scopedKey) {
+          await store.set(scopedKey, { inProgress: false, fingerprint, result: { status, body } });
+        }
+        // After a request timeout (#73) the 503 is already sent; the final
+        // outcome is still recorded above so retries see it.
+        if (!res.headersSent) res.status(status).json(body);
+      };
+
       // File upload
       if (req.file) {
         const parsed = validateFields(filePublishBodySchema, req.body);
         if (!parsed.success) {
           // Validation failures aren't a committed result — release the key so
           // a corrected retry can proceed.
-          if (scopedKey) await store.delete(scopedKey);
+          if (ownsReservation) await store.delete(scopedKey!);
           throw new AppError("VALIDATION_ERROR", "Invalid request body", {
             detail: parsed.error.format(),
           });
@@ -143,23 +193,15 @@ router.post(
 
         const { title, description, price, walletAddress } = parsed.data;
 
-        // Uploads are streamed to disk by multer (#90); read the temp file
-        // back into a buffer for storage. Thumbnail generation now happens
-        // asynchronously in a worker (#89), so the response does not wait on it.
-        if (getRequestSignal(res)?.aborted) {
-          // Timed out before any work started (#73): release the key.
-          if (scopedKey) await store.delete(scopedKey);
-          return;
-        }
-        const fileBuffer = await fs.readFile(req.file.path);
-
+        // Thumbnail generation happens asynchronously in a worker (#89), so
+        // the response does not wait on it.
         const resource = await createFileResource({
           publisherId: publisher.id,
           title,
           description,
           price,
           walletAddress: walletAddress || publisher.walletAddress,
-          fileBuffer,
+          fileBuffer: fileBuffer!,
           filename: req.file.originalname,
           mimeType: req.file.mimetype,
         });
@@ -174,16 +216,10 @@ router.post(
       // Link resource
       const parsed = linkPublishSchema.safeParse(req.body);
       if (!parsed.success) {
-        if (scopedKey) await store.delete(scopedKey);
+        if (ownsReservation) await store.delete(scopedKey!);
         throw new AppError("VALIDATION_ERROR", "Invalid request body", {
           detail: parsed.error.format(),
         });
-      }
-
-      if (getRequestSignal(res)?.aborted) {
-        // Timed out before any work started (#73): release the key.
-        if (scopedKey) await store.delete(scopedKey);
-        return;
       }
 
       const resource = await createLinkResource({
@@ -201,8 +237,10 @@ router.post(
       });
     } catch (err) {
       // Publish failed — release the key so the client can retry rather than
-      // being stuck behind a stale in-progress marker.
-      if (scopedKey) await store.delete(scopedKey);
+      // being stuck behind a stale in-progress marker. Only release it if
+      // this request actually owns the reservation: a conflict error from
+      // someone else's live reservation must not delete their record.
+      if (ownsReservation) await store.delete(scopedKey!);
       throw err;
     } finally {
       // Always remove the disk-stored temp file, whether the request succeeded

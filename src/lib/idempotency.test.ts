@@ -15,30 +15,31 @@ describe("idempotencyCacheKey", () => {
 describe("idempotency store", () => {
   beforeEach(() => getIdempotencyStore().clear());
 
-  it("returns the original result on a repeat lookup", () => {
+  it("returns the original result on a repeat lookup", async () => {
     const store = getIdempotencyStore();
     const key = idempotencyCacheKey("pub1", "k1");
 
     // First request marks the key in progress...
-    store.set(key, { inProgress: true });
-    expect(store.get(key)).toEqual({ inProgress: true });
+    await store.set(key, { inProgress: true, fingerprint: "fp" });
+    expect(await store.get(key)).toEqual({ inProgress: true, fingerprint: "fp" });
 
     // ...then records the committed result.
     const result = { status: 201, body: { id: "r1", title: "Doc" } };
-    store.set(key, { inProgress: false, result });
+    await store.set(key, { inProgress: false, fingerprint: "fp", result });
 
     // A retry sees the same stored result.
-    expect(store.get(key)).toEqual({ inProgress: false, result });
+    expect(await store.get(key)).toEqual({ inProgress: false, fingerprint: "fp", result });
   });
 
-  it("isolates identical keys across different publishers", () => {
+  it("isolates identical keys across different publishers", async () => {
     const store = getIdempotencyStore();
-    store.set(idempotencyCacheKey("pubA", "same"), {
+    await store.set(idempotencyCacheKey("pubA", "same"), {
       inProgress: false,
+      fingerprint: "fp",
       result: { status: 201, body: { id: "A" } },
     });
 
-    expect(store.get(idempotencyCacheKey("pubB", "same"))).toBeUndefined();
+    expect(await store.get(idempotencyCacheKey("pubB", "same"))).toBeUndefined();
   });
 });
 
@@ -61,12 +62,12 @@ describe("idempotency store – concurrent requests", () => {
     const key = idempotencyCacheKey("pub1", "concurrent-key");
 
     // ── Caller A starts first and claims the key ───────────────────────────
-    expect(store.get(key)).toBeUndefined();
-    store.set(key, { inProgress: true });
+    expect(await store.get(key)).toBeUndefined();
+    await store.set(key, { inProgress: true, fingerprint: "fp" });
 
     // ── Caller B arrives while A is still running ──────────────────────────
-    const recordB = store.get(key);
-    expect(recordB).toEqual({ inProgress: true });
+    const recordB = await store.get(key);
+    expect(recordB).toEqual({ inProgress: true, fingerprint: "fp" });
     // Caller B should detect the in-progress marker and NOT write its own
     // entry (simulating the 409-conflict fast-path).
     const callerBPerformedEffect = recordB?.inProgress === false;
@@ -74,15 +75,15 @@ describe("idempotency store – concurrent requests", () => {
 
     // ── Caller A finishes and commits the result ───────────────────────────
     const committedResult = { status: 201, body: { id: "r1", title: "Doc" } };
-    store.set(key, { inProgress: false, result: committedResult });
+    await store.set(key, { inProgress: false, fingerprint: "fp", result: committedResult });
 
     // ── Both callers now observe the same committed result ─────────────────
-    const recordAfterA = store.get(key);
-    expect(recordAfterA).toEqual({ inProgress: false, result: committedResult });
+    const recordAfterA = await store.get(key);
+    expect(recordAfterA).toEqual({ inProgress: false, fingerprint: "fp", result: committedResult });
 
     // Caller B polling/retrying also sees the committed result.
-    const recordBRetry = store.get(key);
-    expect(recordBRetry).toEqual({ inProgress: false, result: committedResult });
+    const recordBRetry = await store.get(key);
+    expect(recordBRetry).toEqual({ inProgress: false, fingerprint: "fp", result: committedResult });
   });
 
   it("concurrent same-key requests produce at most one committed result", async () => {
@@ -91,19 +92,23 @@ describe("idempotency store – concurrent requests", () => {
 
     let effectCount = 0;
 
-    // Simulate two callers running concurrently as micro-tasks.
+    // Simulate two callers running concurrently as micro-tasks. They use
+    // reserve() (#170) rather than a separate get()-then-set(): once get/set
+    // are `await`-ed (as every real store, in-memory or shared, now is), a
+    // manual check-then-set has a gap between the two awaits that two
+    // concurrent callers can both slip through. reserve() closes that gap by
+    // making the claim atomic.
     async function caller(result: { status: number; body: unknown }): Promise<boolean> {
-      // If key is already claimed, back off (simulate 409 fast path).
-      if (store.get(key) !== undefined) return false;
-
-      // Claim the key.
-      store.set(key, { inProgress: true });
+      // Try to claim the key; back off if someone else already holds it
+      // (simulate the 409 fast path).
+      const existing = await store.reserve(key, { inProgress: true, fingerprint: "fp" });
+      if (existing !== undefined) return false;
 
       // Simulate async work (publish effect).
       await Promise.resolve();
       effectCount++;
 
-      store.set(key, { inProgress: false, result });
+      await store.set(key, { inProgress: false, fingerprint: "fp", result });
       return true;
     }
 
@@ -120,22 +125,22 @@ describe("idempotency store – concurrent requests", () => {
     expect(committed).toHaveLength(1);
 
     // The store should hold a single, consistent result.
-    const record = store.get(key);
+    const record = await store.get(key);
     expect(record).toBeDefined();
     expect(record?.inProgress).toBe(false);
   });
 
-  it("returns the committed result to all callers once in-progress resolves", () => {
+  it("returns the committed result to all callers once in-progress resolves", async () => {
     const store = getIdempotencyStore();
     const key = idempotencyCacheKey("pub3", "resolve-key");
     const committed = { status: 201, body: { id: "final" } };
 
-    store.set(key, { inProgress: true });
-    store.set(key, { inProgress: false, result: committed });
+    await store.set(key, { inProgress: true, fingerprint: "fp" });
+    await store.set(key, { inProgress: false, fingerprint: "fp", result: committed });
 
     // All subsequent reads return the same committed result.
     for (let i = 0; i < 5; i++) {
-      expect(store.get(key)).toEqual({ inProgress: false, result: committed });
+      expect(await store.get(key)).toEqual({ inProgress: false, fingerprint: "fp", result: committed });
     }
   });
 
@@ -152,10 +157,10 @@ describe("idempotency store – concurrent requests", () => {
 
     const key = idempotencyCacheKey("pub4", "reuse-key");
     const firstResult = { status: 201, body: { id: "first" } };
-    shortStore.set(key, { inProgress: false, result: firstResult });
+    shortStore.set(key, { inProgress: false, fingerprint: "fp", result: firstResult });
 
     // Before expiry – same result returned.
-    expect(shortStore.get(key)).toEqual({ inProgress: false, result: firstResult });
+    expect(shortStore.get(key)).toEqual({ inProgress: false, fingerprint: "fp", result: firstResult });
 
     // Advance past the TTL.
     now += 200;
@@ -164,61 +169,102 @@ describe("idempotency store – concurrent requests", () => {
     expect(shortStore.get(key)).toBeUndefined();
 
     // A new request can now claim and commit a fresh result.
-    shortStore.set(key, { inProgress: true });
+    shortStore.set(key, { inProgress: true, fingerprint: "fp2" });
     const secondResult = { status: 201, body: { id: "second" } };
-    shortStore.set(key, { inProgress: false, result: secondResult });
+    shortStore.set(key, { inProgress: false, fingerprint: "fp2", result: secondResult });
 
-    expect(shortStore.get(key)).toEqual({ inProgress: false, result: secondResult });
+    expect(shortStore.get(key)).toEqual({ inProgress: false, fingerprint: "fp2", result: secondResult });
   });
 
   // ── Key reuse after failure (#312) ────────────────────────────────────────
 
-  it("allows key reuse after a failed attempt is cleared", () => {
+  it("allows key reuse after a failed attempt is cleared", async () => {
     const store = getIdempotencyStore();
     const key = idempotencyCacheKey("pub5", "failure-key");
 
     // First attempt is in-progress.
-    store.set(key, { inProgress: true });
+    await store.set(key, { inProgress: true, fingerprint: "fp" });
 
     // Simulate failure: caller deletes the key so the next request can retry.
-    store.delete(key);
-    expect(store.get(key)).toBeUndefined();
+    await store.delete(key);
+    expect(await store.get(key)).toBeUndefined();
 
     // A retry can now claim the key and commit a result.
-    store.set(key, { inProgress: true });
+    await store.set(key, { inProgress: true, fingerprint: "fp2" });
     const retryResult = { status: 201, body: { id: "retry-success" } };
-    store.set(key, { inProgress: false, result: retryResult });
+    await store.set(key, { inProgress: false, fingerprint: "fp2", result: retryResult });
 
-    expect(store.get(key)).toEqual({ inProgress: false, result: retryResult });
+    expect(await store.get(key)).toEqual({ inProgress: false, fingerprint: "fp2", result: retryResult });
   });
 
-  it("does not double-apply effects when a client retries after server commit", () => {
+  it("does not double-apply effects when a client retries after server commit", async () => {
     const store = getIdempotencyStore();
     const key = idempotencyCacheKey("pub6", "client-retry-key");
     const originalResult = { status: 201, body: { id: "original" } };
 
     // Server commits the result.
-    store.set(key, { inProgress: true });
-    store.set(key, { inProgress: false, result: originalResult });
+    await store.set(key, { inProgress: true, fingerprint: "fp" });
+    await store.set(key, { inProgress: false, fingerprint: "fp", result: originalResult });
 
     // Client did not receive the response (network blip) and retries.
-    const retryRecord = store.get(key);
+    const retryRecord = await store.get(key);
     // The server detects the committed record and returns the stored result
     // without applying the effect again.
-    expect(retryRecord).toEqual({ inProgress: false, result: originalResult });
+    expect(retryRecord).toEqual({ inProgress: false, fingerprint: "fp", result: originalResult });
     expect((retryRecord as any)?.inProgress).toBe(false);
   });
 
-  it("result consistency: concurrent readers see the same committed body", () => {
+  it("result consistency: concurrent readers see the same committed body", async () => {
     const store = getIdempotencyStore();
     const key = idempotencyCacheKey("pub7", "consistency-key");
     const committed = { status: 201, body: { id: "consistent", title: "Consistent Doc" } };
 
-    store.set(key, { inProgress: false, result: committed });
+    await store.set(key, { inProgress: false, fingerprint: "fp", result: committed });
 
-    const reads = Array.from({ length: 10 }, () => store.get(key));
+    const reads = await Promise.all(Array.from({ length: 10 }, () => store.get(key)));
     reads.forEach((r) => {
-      expect(r).toEqual({ inProgress: false, result: committed });
+      expect(r).toEqual({ inProgress: false, fingerprint: "fp", result: committed });
     });
+  });
+});
+
+// ── Fingerprint mismatch (#171) and atomic reservation (#170) ──────────────
+
+describe("idempotency store – reserve()", () => {
+  beforeEach(() => getIdempotencyStore().clear());
+
+  it("reserve() returns undefined (and claims the key) when it is free", async () => {
+    const store = getIdempotencyStore();
+    const key = idempotencyCacheKey("pub8", "fresh-key");
+
+    expect(await store.reserve(key, { inProgress: true, fingerprint: "fp" })).toBeUndefined();
+    expect(await store.get(key)).toEqual({ inProgress: true, fingerprint: "fp" });
+  });
+
+  it("reserve() returns the existing record instead of claiming an already-held key", async () => {
+    const store = getIdempotencyStore();
+    const key = idempotencyCacheKey("pub9", "held-key");
+
+    await store.set(key, { inProgress: true, fingerprint: "original" });
+
+    const second = await store.reserve(key, { inProgress: true, fingerprint: "different" });
+    expect(second).toEqual({ inProgress: true, fingerprint: "original" });
+    // The second caller's attempt must not have overwritten the first's record.
+    expect(await store.get(key)).toEqual({ inProgress: true, fingerprint: "original" });
+  });
+
+  it("surfaces a fingerprint mismatch so callers can reject it as a conflict", async () => {
+    const store = getIdempotencyStore();
+    const key = idempotencyCacheKey("pub10", "mismatch-key");
+
+    await store.set(key, {
+      inProgress: false,
+      fingerprint: "original-request",
+      result: { status: 201, body: { id: "r1" } },
+    });
+
+    const existing = await store.reserve(key, { inProgress: true, fingerprint: "different-request" });
+    expect(existing?.fingerprint).toBe("original-request");
+    expect(existing?.fingerprint).not.toBe("different-request");
   });
 });

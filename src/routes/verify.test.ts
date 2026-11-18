@@ -20,6 +20,7 @@ const h = vi.hoisted(() => ({
   recentRows: [] as Array<Record<string, unknown>>,
   // Records how many rows each select path was asked to return.
   selectCalls: [] as Array<{ kind: "aggregate" | "recent" | "other"; limit?: number }>,
+  enqueueWebhookEvent: vi.fn(),
 }));
 
 vi.mock("../config.js", () => ({
@@ -36,7 +37,10 @@ vi.mock("../services/verificationService.js", () => ({
   checkOriginality: h.checkOriginality,
 }));
 
-vi.mock("../services/webhookService.js", () => ({ emitToPublisher: vi.fn(), enqueueWebhookEvent: vi.fn() }));
+vi.mock("../services/webhookService.js", () => ({
+  emitToPublisher: vi.fn(),
+  enqueueWebhookEvent: h.enqueueWebhookEvent,
+}));
 
 vi.mock("../db/client.js", () => {
   // A select() chain that supports the resource lookup (where -> limit) and
@@ -81,13 +85,17 @@ vi.mock("../db/client.js", () => {
     return chain;
   };
 
-  return {
-    db: {
-      select: vi.fn((fields?: Record<string, unknown>) => makeChain(fields)),
-      insert: (...args: unknown[]) => h.insert(...args),
-      update: (...args: unknown[]) => h.update(...args),
-    },
+  const db: any = {
+    select: vi.fn((fields?: Record<string, unknown>) => makeChain(fields)),
+    insert: (...args: unknown[]) => h.insert(...args),
+    update: (...args: unknown[]) => h.update(...args),
   };
+  // The route wraps its writes in db.transaction() (#182). This fake doesn't
+  // model real atomicity — it just runs the callback with the same
+  // insert/update spies, which is enough for these tests' assertions.
+  db.transaction = (cb: (tx: typeof db) => Promise<unknown>) => cb(db);
+
+  return { db };
 });
 
 vi.mock("../db/schema.js", () => ({
@@ -445,6 +453,34 @@ describe("POST /verify-content — AI content verification endpoint", () => {
 
       expect(res.status).toBe(409);
       expectNothingChanged();
+    });
+
+    // ── Transactional write (#182) ────────────────────────────────────────
+
+    it("surfaces a mid-transaction failure as an error instead of partially completing", async () => {
+      h.resourceRows = [fileRow()];
+      h.checkOriginality.mockResolvedValue(approved());
+      // The resource-status update is the last write inside the transaction;
+      // make it fail to simulate a mid-sequence failure.
+      h.update.mockImplementation(() => ({
+        set: vi.fn(() => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(() => Promise.reject(new Error("resource update boom"))),
+          })),
+        })),
+      }));
+
+      const res = await request(createTestApp())
+        .post("/verify-content")
+        .set("x-api-key", "key-pub-1")
+        .send({ content: DOC_TEXT, resourceId: "res-1" });
+
+      // The failure propagates out of db.transaction() as an error response —
+      // the handler never reaches the code after it (settlement recording,
+      // the "resource.listed" webhook) that would otherwise make the
+      // workflow look complete despite the failed write.
+      expect(res.status).toBe(500);
+      expect(h.enqueueWebhookEvent).not.toHaveBeenCalled();
     });
   });
 });
