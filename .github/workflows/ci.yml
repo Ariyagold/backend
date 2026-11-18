@@ -78,6 +78,33 @@ jobs:
           DATABASE_URL: postgres://synapse:synapse@127.0.0.1:5432/synapsvault
         run: npm run db:migrate
 
+      # Upgrade test: seed representative prior-version data, then re-run
+      # migrations to prove the upgrade preserves rows and indexes.
+      # Fixtures live in drizzle/upgrade-fixtures/ and are required for any
+      # migration that is not backward compatible (see drizzle/UPGRADES.md).
+      - name: Upgrade from previous released schema
+        env:
+          DATABASE_URL: postgres://synapse:synapse@127.0.0.1:5432/synapsvault
+        run: |
+          if [ -d drizzle/upgrade-fixtures ]; then
+            for fixture in drizzle/upgrade-fixtures/*.sql; do
+              [ -e "$fixture" ] || continue
+              echo "Seeding prior-version data from $fixture"
+              psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$fixture"
+            done
+          else
+            echo "No upgrade fixtures found; skipping prior-version seed"
+          fi
+          echo "Re-running migrations to exercise the upgrade path"
+          npm run db:migrate
+          if [ -d drizzle/upgrade-fixtures ]; then
+            for verify in drizzle/upgrade-fixtures/*.verify.sql; do
+              [ -e "$verify" ] || continue
+              echo "Verifying data and indexes with $verify"
+              psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$verify"
+            done
+          fi
+
       - name: Start container
         run: |
           # Throwaway, unfunded keypair generated per run.
