@@ -9,7 +9,9 @@ import {
   index,
   uniqueIndex,
   jsonb,
+  check,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { createId } from "@paralleldrive/cuid2";
 
 export const resourceTypeEnum = pgEnum("resource_type", ["file", "link"]);
@@ -110,7 +112,10 @@ export const resources = pgTable(
     onchainStatus: onchainStatusEnum("onchain_status").notNull().default("none"),
     onchainTxHash: text("onchain_tx_hash"),
     // Number of on-chain registration attempts made so far. Persisted so the
-    // retry budget survives worker restarts (#84).
+    // retry budget survives worker restarts (#84). Also doubles as a fencing
+    // token (#164): retryResource() conditions its terminal writes on this
+    // value staying unchanged, so a write from a call that outlived its
+    // timeout can't clobber a newer attempt's state.
     onchainAttempts: integer("onchain_attempts").notNull().default(0),
     // Set when onchainStatus transitions to "pending". The retry worker uses
     // this (not createdAt) for its cutoff so a freshly pending old resource
@@ -133,6 +138,11 @@ export const resources = pgTable(
     verificationStatusIdx: index("idx_resources_verification_status").on(table.verificationStatus),
     // The thumbnail worker polls for resources awaiting generation (#89).
     thumbnailStatusIdx: index("idx_resources_thumbnail_status").on(table.thumbnailStatus),
+    // Retry-state assumption: attempts never go negative (#177).
+    onchainAttemptsNonNegative: check(
+      "resources_onchain_attempts_nonneg",
+      sql`${table.onchainAttempts} >= 0`,
+    ),
   }),
 );
 
@@ -153,6 +163,7 @@ export const pendingCleanup = pgTable(
   (table) => ({
     // The cleanup worker drains the queue oldest-first.
     createdAtIdx: index("idx_pending_cleanup_created_at").on(table.createdAt),
+    attemptsNonNegative: check("pending_cleanup_attempts_nonneg", sql`${table.attempts} >= 0`),
   }),
 );
 
@@ -183,6 +194,23 @@ export const verifications = pgTable(
     checkedAtIdx: index("idx_verifications_checked_at").on(table.checkedAt),
     // Verification lookups by resource (#107).
     resourceIdIdx: index("idx_verifications_resource_id").on(table.resourceId),
+    // Confidence is a probability; token counts can't be negative (#176).
+    confidenceRange: check(
+      "verifications_confidence_range",
+      sql`${table.confidence} >= 0 AND ${table.confidence} <= 1`,
+    ),
+    promptTokensNonNegative: check(
+      "verifications_prompt_tokens_nonneg",
+      sql`${table.promptTokens} IS NULL OR ${table.promptTokens} >= 0`,
+    ),
+    completionTokensNonNegative: check(
+      "verifications_completion_tokens_nonneg",
+      sql`${table.completionTokens} IS NULL OR ${table.completionTokens} >= 0`,
+    ),
+    totalTokensNonNegative: check(
+      "verifications_total_tokens_nonneg",
+      sql`${table.totalTokens} IS NULL OR ${table.totalTokens} >= 0`,
+    ),
   }),
 );
 
@@ -240,6 +268,7 @@ export const failedEvents = pgTable(
   (table) => ({
     eventIdIdx: index("idx_failed_events_event_id").on(table.eventId),
     ledgerIdx: index("idx_failed_events_ledger").on(table.ledger),
+    attemptsNonNegative: check("failed_events_attempts_nonneg", sql`${table.attempts} >= 0`),
   }),
 );
 
@@ -318,5 +347,9 @@ export const webhookOutbox = pgTable(
     statusNextIdx: index("idx_webhook_outbox_status_next").on(table.status, table.nextAttemptAt),
     // Publisher delivery-history endpoint queries by publisher_id + created_at.
     publisherIdIdx: index("idx_webhook_outbox_publisher_id").on(table.publisherId, table.createdAt),
+    attemptsNonNegative: check("webhook_outbox_attempts_nonneg", sql`${table.attempts} >= 0`),
+    // A zero or negative delivery budget would never retry, undermining the
+    // outbox's retry-with-backoff contract (#177).
+    maxAttemptsPositive: check("webhook_outbox_max_attempts_positive", sql`${table.maxAttempts} > 0`),
   }),
 );

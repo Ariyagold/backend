@@ -28,11 +28,12 @@ export async function uploadFile(
   fileBuffer: Buffer,
   filename: string,
   mimeType: string,
+  options?: { upsert?: boolean },
 ): Promise<string> {
   const storagePath = `${resourceId}/${filename}`;
   const { error } = await supabase.storage.from(bucket).upload(storagePath, fileBuffer, {
     contentType: mimeType,
-    upsert: false,
+    upsert: options?.upsert ?? false,
   });
   if (error) throw new Error(`Upload failed: ${error.message}`);
   return storagePath;
