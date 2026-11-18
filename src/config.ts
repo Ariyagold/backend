@@ -247,6 +247,9 @@ export const envSchema = z.object({
   // Webhook delivery
   WEBHOOK_TIMEOUT_MS: z.coerce.number().default(10_000),
   WEBHOOK_MAX_ATTEMPTS: z.coerce.number().default(3),
+  // Configurable retention policy for terminal outbox rows (#157)
+  WEBHOOK_OUTBOX_RETENTION_DAYS: z.coerce.number().default(7),
+  WEBHOOK_OUTBOX_CLEANUP_BATCH_SIZE: z.coerce.number().int().min(1).default(100),
 
   // Retry worker (#85): max items processed per tick and per-item timeout so a
   // slow RPC can't make a tick run into the next one.

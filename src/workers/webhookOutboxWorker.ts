@@ -6,11 +6,12 @@
  * the first attempt, a process crash during retries does not lose the event —
  * the next worker run picks it up where it left off.
  */
-import { and, eq, lte, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { webhookOutbox } from "../db/schema.js";
 import { config } from "../config.js";
 import { getLogger } from "../lib/logger.js";
+import { AppError } from "../lib/errors.js";
 import { deliver } from "../services/webhookService.js";
 import { resolveTarget } from "../services/webhookService.js";
 import type { WebhookPayload } from "../services/webhookService.js";
@@ -42,6 +43,7 @@ async function tick(): Promise<void> {
   inFlight = true;
   try {
     await processPending();
+    await cleanupExpiredOutbox();
   } catch (err) {
     getLogger().error({ err, event: "webhook_outbox_tick_error" }, "webhook outbox worker tick failed");
   } finally {
@@ -140,4 +142,96 @@ async function processRow(row: typeof webhookOutbox.$inferSelect): Promise<void>
     { event: "webhook_outbox_retry_scheduled", outboxId: row.id, attempt, nextAttemptAt },
     "outbox webhook retry scheduled",
   );
+}
+
+/**
+ * Replays a failed terminal webhook outbox row (#156).
+ * Restricted to the owning publisher; preserves event identity, audits replay,
+ * and rejects delivered or foreign rows.
+ */
+export async function replayWebhookDelivery(
+  outboxId: string,
+  publisherId: string,
+): Promise<typeof webhookOutbox.$inferSelect> {
+  const log = getLogger();
+
+  const [row] = await db
+    .select()
+    .from(webhookOutbox)
+    .where(eq(webhookOutbox.id, outboxId))
+    .limit(1);
+
+  if (!row) {
+    throw new AppError("NOT_FOUND", "Webhook delivery not found");
+  }
+
+  if (row.publisherId !== publisherId) {
+    throw new AppError("FORBIDDEN", "Not authorized to replay foreign webhook delivery");
+  }
+
+  if (row.status === "delivered") {
+    throw new AppError("CONFLICT", "Cannot replay already delivered webhook");
+  }
+
+  if (row.status === "pending") {
+    throw new AppError("CONFLICT", "Cannot replay pending webhook delivery");
+  }
+
+  const [updated] = await db
+    .update(webhookOutbox)
+    .set({
+      status: "pending",
+      attempts: 0,
+      nextAttemptAt: sql`now()`,
+      lastError: null,
+    })
+    .where(eq(webhookOutbox.id, outboxId))
+    .returning();
+
+  log.info(
+    { event: "webhook_outbox_replay", outboxId, publisherId, webhookEvent: row.event },
+    "outbox webhook replayed",
+  );
+
+  return updated;
+}
+
+/**
+ * Deletes terminal outbox rows (delivered or failed) after a configurable retention interval (#157).
+ * Retains pending rows and returns the number of cleaned rows.
+ */
+export async function cleanupExpiredOutbox(
+  options: { retentionDays?: number; batchSize?: number } = {},
+): Promise<number> {
+  const log = getLogger();
+  const retentionDays = options.retentionDays ?? config.WEBHOOK_OUTBOX_RETENTION_DAYS;
+  const batchSize = options.batchSize ?? config.WEBHOOK_OUTBOX_CLEANUP_BATCH_SIZE;
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+
+  // Find terminal rows older than cutoff (retains pending rows)
+  const expired = await db
+    .select({ id: webhookOutbox.id })
+    .from(webhookOutbox)
+    .where(
+      and(
+        inArray(webhookOutbox.status, ["delivered", "failed"]),
+        or(
+          lte(webhookOutbox.deliveredAt, cutoff),
+          and(isNull(webhookOutbox.deliveredAt), lte(webhookOutbox.createdAt, cutoff)),
+        ),
+      ),
+    )
+    .limit(batchSize);
+
+  if (expired.length === 0) return 0;
+
+  const expiredIds = expired.map((r) => r.id);
+  await db.delete(webhookOutbox).where(inArray(webhookOutbox.id, expiredIds));
+
+  log.info(
+    { event: "webhook_outbox_cleanup", count: expired.length, retentionDays },
+    "expired terminal webhook outbox rows cleaned",
+  );
+
+  return expired.length;
 }

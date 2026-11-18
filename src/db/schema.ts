@@ -318,5 +318,7 @@ export const webhookOutbox = pgTable(
     statusNextIdx: index("idx_webhook_outbox_status_next").on(table.status, table.nextAttemptAt),
     // Publisher delivery-history endpoint queries by publisher_id + created_at.
     publisherIdIdx: index("idx_webhook_outbox_publisher_id").on(table.publisherId, table.createdAt),
+    // Retention cleanup queries terminal rows by status and delivered_at (#157).
+    statusDeliveredIdx: index("idx_webhook_outbox_status_delivered").on(table.status, table.deliveredAt),
   }),
 );
