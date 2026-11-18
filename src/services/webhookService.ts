@@ -1,4 +1,6 @@
 import { createHmac, randomBytes } from "node:crypto";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { promises as dns } from "node:dns";
 import { eq } from "drizzle-orm";
 import { config } from "../config.js";
@@ -29,12 +31,29 @@ export interface DeliveryResult {
   attempts: number;
   status?: number;
   error?: string;
+  retryable?: boolean;
+  retryAfterMs?: number;
 }
 
 const BASE_RETRY_DELAY_MS = 1_000;
+export const MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1_000;
 
 export const SIGNATURE_HEADER = "X-SynapsVault-Signature";
 export const DELIVERY_ID_HEADER = "X-SynapsVault-Id";
+
+const PERMANENT_HTTP_STATUSES = new Set([400, 401, 403, 404, 405, 410, 422]);
+
+/** Parses Retry-After seconds or an HTTP date, clamped to a safe one-day bound. */
+export function parseRetryAfter(value: string | null | undefined, now = Date.now()): number | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) {
+    return Math.min(Number(trimmed) * 1_000, MAX_RETRY_AFTER_MS);
+  }
+  const timestamp = Date.parse(trimmed);
+  if (!Number.isFinite(timestamp)) return undefined;
+  return Math.min(Math.max(0, timestamp - now), MAX_RETRY_AFTER_MS);
+}
 
 /**
  * Hex HMAC-SHA256 of `${timestamp}.${body}`, keyed by the publisher's webhook
@@ -57,13 +76,13 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 export async function deliver(
   target: Pick<WebhookTarget, "url" | "secret">,
   payload: WebhookPayload,
-  options: { maxAttempts?: number } = {},
+  options: { maxAttempts?: number; deliveryId?: string } = {},
 ): Promise<DeliveryResult> {
   const log = getLogger();
   const body = JSON.stringify(payload);
   // Each delivery gets a unique, stable id so receivers can deduplicate
   // retried deliveries (#45).
-  const deliveryId = `wh_${randomBytes(16).toString("hex")}`;
+  const deliveryId = options.deliveryId ?? `wh_${randomBytes(16).toString("hex")}`;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "User-Agent": "SynapsVault-Webhooks/1.0",
@@ -110,19 +129,21 @@ export async function deliver(
     }
 
     try {
-      const res = await fetch(target.url, {
-        method: "POST",
-        headers,
-        body,
-        redirect: "manual",
-        signal: AbortSignal.timeout(config.WEBHOOK_TIMEOUT_MS),
-      });
+      const res = await requestPinned(parsedUrl, addrs[0], headers, body, config.WEBHOOK_TIMEOUT_MS);
       lastStatus = res.status;
-      if (res.ok) {
+      if (res.status >= 200 && res.status < 300) {
         log.info({ event: "webhook_delivered", webhookEvent: payload.event, attempt }, "webhook delivered");
         return { delivered: true, attempts: attempt, status: res.status };
       }
       lastError = `HTTP ${res.status}`;
+      const retryable = res.status === 429 || res.status >= 500;
+      if (!retryable || PERMANENT_HTTP_STATUSES.has(res.status)) {
+        return { delivered: false, attempts: attempt, status: res.status, error: lastError, retryable: false };
+      }
+      const retryAfterMs = parseRetryAfter(res.retryAfter);
+      if (attempt >= maxAttempts) {
+        return { delivered: false, attempts: attempt, status: res.status, error: lastError, retryable: true, retryAfterMs };
+      }
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
     }
@@ -132,7 +153,37 @@ export async function deliver(
   }
 
   log.error({ event: "webhook_failed", webhookEvent: payload.event, attempts: maxAttempts, error: lastError }, "webhook delivery failed");
-  return { delivered: false, attempts: maxAttempts, status: lastStatus, error: lastError };
+  return { delivered: false, attempts: maxAttempts, status: lastStatus, error: lastError, retryable: true };
+}
+
+function requestPinned(
+  url: URL,
+  address: string,
+  headers: Record<string, string>,
+  body: string,
+  timeoutMs: number,
+): Promise<{ status: number; retryAfter: string | null }> {
+  const request = url.protocol === "https:" ? httpsRequest : httpRequest;
+  return new Promise((resolve, reject) => {
+    const req = request(
+      {
+        protocol: url.protocol,
+        hostname: address,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method: "POST",
+        headers: { ...headers, Host: url.host },
+        ...(url.protocol === "https:" ? { servername: url.hostname } : {}),
+      },
+      (res) => {
+        res.resume();
+        res.once("end", () => resolve({ status: res.statusCode ?? 0, retryAfter: res.headers["retry-after"] ?? null }));
+      },
+    );
+    req.setTimeout(timeoutMs, () => req.destroy(new Error("webhook request timed out")));
+    req.once("error", reject);
+    req.end(body);
+  });
 }
 
 /** Loads the publisher's enabled webhook target, or null when not configured. */
@@ -219,6 +270,7 @@ export async function enqueueWebhookEvent(
         event,
         payload,
         maxAttempts: config.WEBHOOK_MAX_ATTEMPTS,
+        deliveryId: `wh_${randomBytes(16).toString("hex")}`,
       })
       .returning({ id: webhookOutbox.id });
 
