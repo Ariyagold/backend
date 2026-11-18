@@ -1,67 +1,8 @@
-<div align="center">
-  <h1>⬡ SynapsVault — Backend</h1>
-  <p><strong>Express API server for the SynapsVault knowledge vault marketplace</strong></p>
-  <p>
-    <a href="https://github.com/SynapsVault/backend/actions"><img src="https://github.com/SynapsVault/backend/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-    <img src="https://img.shields.io/badge/Node.js-24-green" alt="Node.js">
-    <img src="https://img.shields.io/badge/TypeScript-6-blue" alt="TypeScript">
-    <img src="https://img.shields.io/badge/Stellar-x402-7D00FF" alt="Stellar">
-    <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT">
-  </p>
-</div>
+# Backend Service
 
----
+A Node.js/TypeScript backend service with PostgreSQL, Drizzle ORM, and Docker-based deployment.
 
-## Overview
-
-SynapsVault-backend is the Express.js API powering the SynapsVault marketplace. It handles:
-
-- **Publisher registration** — API key issuance, wallet linking
-- **Resource publishing** — file upload to Supabase, link registration
-- **x402 payment verification** — Stellar USDC micropayment validation
-- **On-chain registration** — Soroban vault-registry contract calls
-- **Catalog serving** — searched, filtered, paginated resource listings
-- **Admin panel** — protected stats, force-delist, payment audit
-- **Webhook delivery** — HMAC-signed event fanout to publisher endpoints
-
-## Architecture
-
-```
-                    ┌─────────────────────────────────────────┐
-                    │           SynapsVault Backend             │
-                    │                                         │
-  Frontend ──────►  │  Express app                            │
-  (React/Vite)      │  ├── /resources    CRUD + catalog       │
-                    │  ├── /verify-content  AI originality    │
-                    │  ├── /publishers   profile + keys       │
-                    │  ├── /registry     on-chain status      │
-                    │  ├── /payments     receipts + history   │
-                    │  ├── /admin        protected stats      │
-                    │  ├── /health       k8s probes           │
-                    │  └── /docs         OpenAPI + Swagger    │
-                    │                                         │
-                    │  Middleware stack                        │
-                    │  ├── CORS + Security headers            │
-                    │  ├── Rate limiting (IP + wallet)        │
-                    │  ├── API key auth                       │
-                    │  ├── Request signature auth             │
-                    │  ├── Audit log (all mutations)          │
-                    │  ├── Circuit breaker (Stellar RPC)      │
-                    │  └── Request tracing (OpenTelemetry)    │
-                    └──────────────┬──────────────────────────┘
-                                   │
-               ┌───────────────────┼───────────────────┐
-               ▼                   ▼                   ▼
-        Supabase DB         Stellar Horizon      Soroban Contracts
-        (PostgreSQL)        (x402 + USDC)       (vault-registry
-        resources           payment verify       access-lease
-        payments            tx submission        subscription)
-        publishers
-```
-
-## Quick start
-
-Requires **Node.js 24** (npm 11) and PostgreSQL 16.
+## Getting Started
 
 ```bash
 git clone https://github.com/SynapsVault/backend SynapsVault-backend
@@ -172,119 +113,43 @@ function verifyWebhook(req, secret) {
     throw new Error("Invalid webhook signature");
   }
 }
+npm install
+npm run dev
 ```
 
-Failures are retried with exponential backoff (`WEBHOOK_MAX_ATTEMPTS`).
-Private and loopback URLs are rejected.
+## Development
 
-### Request signatures (#42, #43, #44)
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for local setup, migrations, and workflow details.
 
-Publisher mutation endpoints (`POST /resources`, `DELETE /resources/:id`, etc.)
-support — and in production **require** — HMAC-SHA256 request signatures.
+## Release Provenance
 
-**How it works**
+Every published backend image embeds reproducible release metadata and ships with a dependency SBOM so operators can identify exactly what is running in a container.
 
-Every publisher receives a per-publisher **signing secret** (separate from the
-API key) on registration. The signing secret is the HMAC key, not the API key
-itself. This means an attacker who intercepts the API key cannot forge signed
-requests.
+### Embedded metadata
 
-**Signing a request (client side)**
+The Docker image is built with the following build args, which are surfaced as OCI labels and environment variables:
 
-```js
-const crypto = require("crypto");
+| Build arg     | OCI label                     | Env var       | Description                          |
+| ------------- | ----------------------------- | ------------- | ------------------------------------ |
+| `GIT_COMMIT`  | `org.opencontainers.image.revision` | `GIT_COMMIT`  | Full git SHA the image was built from |
+| `VERSION`     | `org.opencontainers.image.version`  | `APP_VERSION` | Release version / tag                |
+| `BUILD_DATE`  | `org.opencontainers.image.created`  | —             | Build timestamp (ISO 8601)           |
 
-function signRequest({ signingSecret, method, path, timestamp, bodyHash, idempotencyKey }) {
-  const parts = [method.toUpperCase(), path, timestamp, bodyHash];
-  if (idempotencyKey) parts.push(idempotencyKey);
-  const canonical = parts.join("\n");
-  return crypto.createHmac("sha256", signingSecret).update(canonical, "utf8").digest("hex");
-}
+These values are injected by CI from the workflow context only — no environment secrets are baked into the image.
 
-const timestamp = Math.floor(Date.now() / 1000).toString();
-const bodyHash = crypto.createHash("sha256").update(rawBody, "utf8").digest("hex");
+### Mapping an image digest to its source commit and SBOM
 
-const signature = signRequest({
-  signingSecret: "<your signing secret>",
-  method: "POST",
-  path: "/resources/res-1/register",
-  timestamp,
-  bodyHash,
-});
+1. **Read the labels** from the image digest:
 
-// Add to request headers:
-// x-api-key: <your API key>
-// X-Timestamp: <timestamp>
-// X-Signature: <signature>
-```
+   ```bash
+   docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+     ghcr.io/<owner>/<repo>@sha256:<digest>
+   ```
 
-**Rotating the signing secret**
+   The `org.opencontainers.image.revision` label is the source commit SHA. The `org.opencontainers.image.version` label is the release version.
 
-```
-POST /publishers/me/signing-secret/rotate
-x-api-key: <your API key>
-```
+2. **Locate the SBOM** for that release. Each release publishes a CycloneDX SBOM artifact named `sbom-<version>.cdx.json` (attached to the GitHub Release and uploaded as a CI artifact). Download it from the release page or the workflow run that produced the image.
 
-Returns `{ signingSecret, rotatedAt }`. The new secret is shown once — store it
-securely. The old secret is immediately invalid.
+3. **Cross-check** the SBOM against the commit by inspecting the `metadata.component` and `metadata.properties` fields, which record the same commit SHA and version embedded in the image labels.
 
-**Environment variables**
-
-| Variable | Default | Description |
-|---|---|---|
-| `REQUIRE_REQUEST_SIGNATURE` | `true` (prod) / `false` (dev) | Enforce HMAC signatures on publisher mutations (#44) |
-| `SIGNING_SECRET_KEY` | — | AES-256 encryption key for signing secrets at rest. Required when `REQUIRE_REQUEST_SIGNATURE=true` (#42) |
-| `SIGNATURE_MAX_SKEW_MS` | `300000` | Max clock skew (ms) for `X-Timestamp` |
-
-**Production behaviour (#44):** `REQUIRE_REQUEST_SIGNATURE` defaults to `true`
-in production. If it is explicitly set to `false`, the server logs a security
-warning at boot. `SIGNING_SECRET_KEY` must be provided when signatures are
-required.
-
-## Rate limiting
-
-All rate limits use a sliding-window algorithm. Responses include `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset` headers. Blocked requests return `429` with `{ "error": "Too many requests", "code": "RATE_LIMITED", "retryAfterSeconds": N }` and a `Retry-After` header.
-
-| Limiter | Scope | Default | Env vars |
-|---|---|---|---|
-| Registration | IP | 10 per hour | `RATE_LIMIT_REGISTER_IP_MAX`, `RATE_LIMIT_REGISTER_IP_WINDOW_MS` |
-| Verify-content | IP | 10 / min | `RATE_LIMIT_VERIFY_IP_MAX`, `RATE_LIMIT_VERIFY_IP_WINDOW_MS` |
-| Verify-content | Wallet | 5 / hour | `RATE_LIMIT_VERIFY_WALLET_MAX`, `RATE_LIMIT_VERIFY_WALLET_WINDOW_MS` |
-| Publish resource | IP | 20 / min | `RATE_LIMIT_PUBLISH_IP_MAX`, `RATE_LIMIT_PUBLISH_IP_WINDOW_MS` |
-| Publish resource | Wallet | 10 / hour | `RATE_LIMIT_PUBLISH_WALLET_MAX`, `RATE_LIMIT_PUBLISH_WALLET_WINDOW_MS` |
-| Publisher API routes | Per publisher | 60 RPM | `PUBLISHER_RATE_LIMIT_RPM_DEFAULT`, `PUBLISHER_RATE_LIMIT_MAX_RPM` |
-
-**Registration rate limit** (`POST /publishers`): at most `RATE_LIMIT_REGISTER_IP_MAX` (default **10**) registrations per IP within `RATE_LIMIT_REGISTER_IP_WINDOW_MS` (default **1 hour**). This prevents bulk account and API-key creation from a single IP address.
-
-Publishers can inspect and override their own per-publisher limit via `PATCH /publishers/me/rate-limit` (up to `PUBLISHER_RATE_LIMIT_MAX_RPM`).
-
-## Environment variables
-
-See [`.env.example`](./.env.example) for the full list and descriptions.
-When deploying to Railway, set `TRUST_PROXY=1` so Express rate limits use the
-client IP forwarded by Railway. Proxy trust is disabled outside production.
-
-## CI
-
-Every push and PR to `main`/`dev` runs [`ci.yml`](.github/workflows/ci.yml):
-
-1. **Typecheck & Test**: `npm ci`, `npm run typecheck`, `npm test`, `npm run build`
-2. **Docker build & smoke test**: builds the image, applies migrations to a
-   Postgres service, boots the container and checks key endpoints.
-
-[`catalog-seed.yml`](.github/workflows/catalog-seed.yml) runs weekly (or on
-demand) to seed a testnet catalog and verify it end to end.
-
-## Repo siblings
-
-| Repo | Description |
-|---|---|
-| [SynapsVault-frontend](https://github.com/SynapsVault/frontend) | React UI |
-| [SynapsVault-contracts](https://github.com/SynapsVault/contracts) | Soroban contracts |
-
-## License
-
-MIT © 2025 Busiii-adetiba
-## Database TLS
-
-Outside localhost the Postgres server certificate is verified (`rejectUnauthorized: true`). If your database uses a private CA, set `DATABASE_CA_CERT` to the PEM-encoded CA bundle (literal `\n` sequences are accepted for single-line env vars).
+If the labels are missing, the image was not built through the release workflow and should not be treated as a reproducible release.

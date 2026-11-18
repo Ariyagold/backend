@@ -15,9 +15,22 @@ RUN npx tsc -p packages/registry-client && npm run build && npm prune --omit=dev
 # ── Runtime stage ───────────────────────────────────────────────────────────
 FROM node:24-alpine
 WORKDIR /app
+
+# Release provenance: injected by CI at build time (no secrets).
+ARG GIT_COMMIT=unknown
+ARG APP_VERSION=0.0.0
+ARG BUILD_DATE=unknown
+
 ENV NODE_ENV=production \
     PORT=3000 \
-    LEDGER_TRACKER_PATH=/app/data/last-processed-ledger.json
+    LEDGER_TRACKER_PATH=/app/data/last-processed-ledger.json \
+    GIT_COMMIT=${GIT_COMMIT} \
+    APP_VERSION=${APP_VERSION}
+
+LABEL org.opencontainers.image.title="synapse-backend" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
 
 COPY --from=builder /app/package.json ./
 COPY --from=builder /app/node_modules ./node_modules

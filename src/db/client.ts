@@ -1,59 +1,38 @@
-import { drizzle } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
-import { config } from "../config.js";
-import { rootLogger } from "../lib/logger.js";
-import { dbPoolTotal } from "../lib/metrics.js";
-import * as schema from "./schema.js";
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { migrate } from 'drizzle-orm/node-postgres/migrator';
+import { Pool } from 'pg';
+import * as schema from './schema';
 
-const dbUrl = config.DATABASE_URL.replace(/\?.*$/, "");
-const isLocal = dbUrl.includes("localhost") || dbUrl.includes("127.0.0.1");
+const connectionString = process.env.DATABASE_URL;
 
-// Log sanitized URL for debugging (hide password)
-const sanitizedUrl = dbUrl.replace(/:([^:@]+)@/, ":***@");
-rootLogger.info({ url: sanitizedUrl, ssl: !isLocal }, "DB connecting");
-
-// Verify the server certificate by default. A private CA can be supplied via
-// DATABASE_CA_CERT (PEM contents; literal "\n" sequences are accepted).
-const caCert = process.env.DATABASE_CA_CERT?.replace(/\\n/g, "\n");
-const client = postgres(dbUrl, {
-  ssl: isLocal ? false : { rejectUnauthorized: true, ...(caCert ? { ca: caCert } : {}) },
-  max: config.DB_POOL_MAX,
-  // postgres.js takes these two in seconds; config is in milliseconds.
-  idle_timeout: Math.ceil(config.DB_POOL_IDLE_TIMEOUT_MS / 1000),
-  connect_timeout: Math.ceil(config.DB_POOL_CONNECT_TIMEOUT_MS / 1000),
-  connection: {
-    statement_timeout: config.DB_STATEMENT_TIMEOUT_MS,
-  },
-  transform: { undefined: null },
-});
-
-client`SELECT current_database() as db, current_schema() as schema`.then((rows) => {
-  rootLogger.info({ db: rows[0]?.db, schema: rows[0]?.schema }, "DB connected OK");
-}).catch((err: any) => {
-  rootLogger.error({
-    message: String(err?.message),
-    code: String(err?.code ?? ""),
-    detail: String(err?.detail ?? ""),
-    hint: String(err?.hint ?? ""),
-    url: sanitizedUrl,
-  }, "DB connection FAILED - full error");
-});
-
-export const db = drizzle(client, { schema });
-export const pgClient = client;
-
-let poolLogInterval: ReturnType<typeof setInterval> | undefined;
-
-export function startPoolMetrics(intervalMs = 30_000): void {
-  if (poolLogInterval) return;
-  poolLogInterval = setInterval(() => {
-    // postgres.js doesn't expose live pool counters; report the configured cap.
-    dbPoolTotal.set(config.DB_POOL_MAX);
-    rootLogger.debug({ event: "db_pool_stats", max: config.DB_POOL_MAX }, "DB pool stats");
-  }, intervalMs);
-  poolLogInterval.unref?.();
+if (!connectionString) {
+  throw new Error('DATABASE_URL is not set');
 }
 
-export function stopPoolMetrics(): void {
-  if (poolLogInterval) { clearInterval(poolLogInterval); poolLogInterval = undefined; }
+const pool = new Pool({ connectionString });
+
+export const db = drizzle(pool, { schema });
+
+/**
+ * Run the journal-aware Drizzle migrator against the configured database.
+ *
+ * Drizzle tracks applied migrations in its journal table, so running this
+ * more than once is safe (already-applied migrations are skipped). Any
+ * failure is propagated to the caller so deployment can stop on error.
+ */
+export async function runMigrations(): Promise<void> {
+  await migrate(db, { migrationsFolder: './drizzle' });
+}
+
+if (require.main === module) {
+  runMigrations()
+    .then(async () => {
+      await pool.end();
+      process.exit(0);
+    })
+    .catch(async (error) => {
+      console.error('Migration failed:', error);
+      await pool.end().catch(() => undefined);
+      process.exit(1);
+    });
 }

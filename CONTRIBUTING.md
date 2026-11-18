@@ -126,12 +126,48 @@ npm run db:generate   # Create migration
 npm run db:migrate    # Apply migration
 ```
 
+### Upgrade Testing (Previous Released Schema)
+
+Fresh-database migration smoke tests cannot catch incompatibilities with existing
+production rows. Every migration must therefore be validated as an *upgrade* from
+the previously released schema, not only as a fresh install.
+
+**Supported upgrade paths**
+
+- Upgrades are supported from the **immediately previous released schema** to the
+  current `main`. Each release tag (`vX.Y.Z`) is a supported upgrade source for the
+  next release.
+- Skipping releases (e.g. `v1.0.0` → `v1.3.0`) is only supported when every
+  intermediate migration is additive. If any intermediate migration is
+  incompatible (drops/renames columns, tightens constraints, backfills), the
+  upgrade must be performed step-by-step through each release.
+- Downgrades are **not** supported.
+
+**Upgrade fixtures**
+
+- Upgrade fixtures live under `drizzle/upgrade-fixtures/<from-version>/` and
+  contain representative prior-version data (SQL seed files) for the released
+  schema they target.
+- The upgrade test seeds a database with the fixture, runs `npm run db:migrate`,
+  and asserts that existing rows are preserved and that indexes/constraints are
+  present and valid.
+- **Incompatible migrations require a fixture.** If a migration drops or renames
+  columns, tightens constraints, or backfills data, the PR must add or update the
+  corresponding upgrade fixture and the assertions that verify the transformation.
+  PRs with incompatible migrations and no fixture will not be merged.
+
+```bash
+# Run upgrade tests locally (seeds prior-version data, then migrates)
+npm run test:upgrade
+```
+
 ## Code Review Checklist
 
 - [ ] TypeScript compiles (`npm run typecheck`)
 - [ ] Tests pass (`npm run test`)
 - [ ] No console.log in production code
 - [ ] Database migrations included
+- [ ] Upgrade fixture added/updated for incompatible migrations
 - [ ] Error handling for edge cases
 - [ ] Follows conventional commit format
 
