@@ -65,6 +65,8 @@ const MANAGED_KEYS = [
 const VALID_STELLAR_SECRET = 'SDUGOO2E42N3DECYVMUHGZWZ7P2FXUPLAHC2UEJ477CMF47CBU23BWMS';
 const VALID_STELLAR_PUBLIC = 'GDEJJLXV2CNHF5HEGX34MU4G6L4PRVUAGD4ANF77ZDYTQJKSDSDYVVI6';
 const VALID_CONTRACT_ID = 'CBQEIMSRPSRKJJHGOELZTP3CISZVHZ6WPKZTWJMYZXHFXPGHHWFQBD4H';
+// A second valid Soroban contract id (testnet USDC SAC) distinct from the one above.
+const VALID_CONTRACT_ID_2 = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA';
 
 let savedEnv: EnvSnapshot;
 
@@ -256,6 +258,46 @@ describe('config defaults', () => {
   });
 });
 
+describe('numeric config ranges', () => {
+  it('rejects an out-of-range PORT and names the variable', async () => {
+    setEnv(baseValidEnv({ PORT: '99999' }));
+    const { message } = await loadConfigExpectingFailure();
+    expect(message.toLowerCase()).toContain('port');
+  });
+
+  it('rejects a fractional rate-limit count', async () => {
+    setEnv(baseValidEnv({ RATE_LIMIT_VERIFY_IP_MAX: '2.5' }));
+    const { message } = await loadConfigExpectingFailure();
+    expect(message.toLowerCase()).toContain('rate_limit_verify_ip_max');
+  });
+
+  it('rejects a negative window', async () => {
+    setEnv(baseValidEnv({ RATE_LIMIT_VERIFY_IP_WINDOW_MS: '-100' }));
+    const { message } = await loadConfigExpectingFailure();
+    expect(message.toLowerCase()).toContain('rate_limit_verify_ip_window_ms');
+  });
+
+  it('rejects a zero file-size limit', async () => {
+    setEnv(baseValidEnv({ MAX_FILE_SIZE_MB: '0' }));
+    const { message } = await loadConfigExpectingFailure();
+    expect(message.toLowerCase()).toContain('max_file_size_mb');
+  });
+
+  it('rejects a zero verification timeout', async () => {
+    setEnv(baseValidEnv({ VERIFICATION_TIMEOUT_MS: '0' }));
+    const { message } = await loadConfigExpectingFailure();
+    expect(message.toLowerCase()).toContain('verification_timeout_ms');
+  });
+
+  it('accepts documented lower-bound values', async () => {
+    setEnv(baseValidEnv({ PORT: '1', MAX_FILE_SIZE_MB: '1', RATE_LIMIT_VERIFY_IP_MAX: '1' }));
+    const { config } = await loadConfig();
+    expect(config.PORT).toBe(1);
+    expect(config.MAX_FILE_SIZE_MB).toBe(1);
+    expect(config.RATE_LIMIT_VERIFY_IP_MAX).toBe(1);
+  });
+});
+
 describe('envFlag parsing for REQUIRE_REQUEST_SIGNATURE', () => {
   const truthy = ['true', '1', 'yes'];
   const falsy = ['false', '0', 'no', ''];
@@ -368,6 +410,42 @@ describe('network checks', () => {
   });
 });
 
+describe('STELLAR_NETWORK aliases', () => {
+  it('rejects a misspelled STELLAR_NETWORK instead of defaulting to testnet', async () => {
+    setEnv(baseValidEnv({ STELLAR_NETWORK: 'tsetnet' }));
+    const { message } = await loadConfigExpectingFailure();
+    expect(message.toLowerCase()).toContain('stellar_network');
+    expect(message.toLowerCase()).toContain('tsetnet');
+  });
+
+  it('rejects an unrecognized nonempty value', async () => {
+    setEnv(baseValidEnv({ STELLAR_NETWORK: 'futurenet' }));
+    const { message } = await loadConfigExpectingFailure();
+    expect(message.toLowerCase()).toContain('stellar_network');
+  });
+
+  it.each(['mainnet', 'pubnet', 'public'])('resolves the %s alias to mainnet', async (alias) => {
+    setEnv(baseValidEnv({ STELLAR_NETWORK: alias }));
+    const { config } = await loadConfig();
+    expect(config.STELLAR_NETWORK).toBe('mainnet');
+    expect(config.NETWORK).toBe('stellar:pubnet');
+  });
+
+  it('is case-insensitive', async () => {
+    setEnv(baseValidEnv({ STELLAR_NETWORK: 'Mainnet' }));
+    const { config } = await loadConfig();
+    expect(config.STELLAR_NETWORK).toBe('mainnet');
+  });
+
+  it('keeps the documented testnet default when STELLAR_NETWORK is unset', async () => {
+    const env = baseValidEnv();
+    delete env.STELLAR_NETWORK;
+    setEnv(env);
+    const { config } = await loadConfig();
+    expect(config.STELLAR_NETWORK).toBe('testnet');
+  });
+});
+
 describe('production-only checks', () => {
   it('loads successfully in test environment with valid config', async () => {
     setEnv(baseValidEnv({ NODE_ENV: 'test' }));
@@ -464,6 +542,74 @@ describe('applyNetworkEnvDefaults behaviors', () => {
     expect(config.REGISTRY_CONTRACT_ID).toBe(VALID_CONTRACT_ID);
   });
 });
+describe('registry contract aliases', () => {
+  it('accepts a single REGISTRY_CONTRACT_ID alias', async () => {
+    const env = baseValidEnv();
+    delete env.VAULT_REGISTRY_CONTRACT_ID;
+    setEnv({ ...env, REGISTRY_CONTRACT_ID: VALID_CONTRACT_ID });
+    const { config } = await loadConfig();
+    expect(config.REGISTRY_CONTRACT_ID).toBe(VALID_CONTRACT_ID);
+    expect(config.VAULT_REGISTRY_CONTRACT_ID).toBe(VALID_CONTRACT_ID);
+  });
+
+  it('accepts matching REGISTRY_CONTRACT_ID and VAULT_REGISTRY_CONTRACT_ID', async () => {
+    setEnv(
+      baseValidEnv({
+        REGISTRY_CONTRACT_ID: VALID_CONTRACT_ID,
+        VAULT_REGISTRY_CONTRACT_ID: VALID_CONTRACT_ID,
+      }),
+    );
+    const { config } = await loadConfig();
+    expect(config.REGISTRY_CONTRACT_ID).toBe(VALID_CONTRACT_ID);
+    expect(config.VAULT_REGISTRY_CONTRACT_ID).toBe(VALID_CONTRACT_ID);
+  });
+
+  it('rejects conflicting valid contract IDs and names both aliases', async () => {
+    setEnv(
+      baseValidEnv({
+        REGISTRY_CONTRACT_ID: VALID_CONTRACT_ID,
+        VAULT_REGISTRY_CONTRACT_ID: VALID_CONTRACT_ID_2,
+      }),
+    );
+    const { message } = await loadConfigExpectingFailure();
+    expect(message.toLowerCase()).toContain('registry_contract_id');
+    expect(message.toLowerCase()).toContain('vault_registry_contract_id');
+    expect(message.toLowerCase()).toContain('differ');
+  });
+});
+
+describe('outbound service URLs and asset identifiers', () => {
+  it('rejects a FACILITATOR_URL with an unsupported scheme', async () => {
+    setEnv(baseValidEnv({ FACILITATOR_URL: 'ftp://facilitator.example.com' }));
+    const { message } = await loadConfigExpectingFailure();
+    expect(message.toLowerCase()).toContain('facilitator_url');
+  });
+
+  it('rejects a malformed FACILITATOR_URL', async () => {
+    setEnv(baseValidEnv({ FACILITATOR_URL: 'not a url' }));
+    const { message } = await loadConfigExpectingFailure();
+    expect(message.toLowerCase()).toContain('facilitator_url');
+  });
+
+  it('accepts a valid http(s) FACILITATOR_URL', async () => {
+    setEnv(baseValidEnv({ FACILITATOR_URL: 'https://facilitator.example.com' }));
+    const { config } = await loadConfig();
+    expect(config.FACILITATOR_URL).toBe('https://facilitator.example.com');
+  });
+
+  it('rejects a malformed USDC_CONTRACT_ID', async () => {
+    setEnv(baseValidEnv({ USDC_CONTRACT_ID: 'not-a-contract' }));
+    const { message } = await loadConfigExpectingFailure();
+    expect(message.toLowerCase()).toContain('usdc_contract_id');
+  });
+
+  it('accepts a valid USDC_CONTRACT_ID', async () => {
+    setEnv(baseValidEnv({ USDC_CONTRACT_ID: VALID_CONTRACT_ID }));
+    const { config } = await loadConfig();
+    expect(config.USDC_CONTRACT_ID).toBe(VALID_CONTRACT_ID);
+  });
+});
+
 describe('replay protection failure policy', () => {
   it('defaults to fail-open outside production and validates the enum', async () => {
     setEnv(baseValidEnv());
