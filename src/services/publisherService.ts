@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { publishers, resources } from "../db/schema.js";
 import { generateApiKey, hashApiKey, generateSigningSecret, encryptSigningSecret } from "../utils/crypto.js";
-import { config } from "../config.js";
+import { signingKeyring } from "../lib/secretKeys.js";
 
 export async function registerPublisher(data: {
   name: string;
@@ -21,9 +21,8 @@ export async function registerPublisher(data: {
   // unencrypted (acceptable only in development / before signatures are
   // required).
   const signingSecret = generateSigningSecret();
-  const storedSigningSecret = config.SIGNING_SECRET_KEY
-    ? encryptSigningSecret(signingSecret, config.SIGNING_SECRET_KEY)
-    : signingSecret;
+  const keyring = signingKeyring();
+  const storedSigningSecret = keyring ? encryptSigningSecret(signingSecret, keyring) : signingSecret;
 
   const [publisher] = await db
     .insert(publishers)
@@ -84,9 +83,8 @@ export async function rotateApiKey(publisherId: string): Promise<string> {
  */
 export async function rotateSigningSecret(publisherId: string): Promise<string> {
   const signingSecret = generateSigningSecret();
-  const storedSigningSecret = config.SIGNING_SECRET_KEY
-    ? encryptSigningSecret(signingSecret, config.SIGNING_SECRET_KEY)
-    : signingSecret;
+  const keyring = signingKeyring();
+  const storedSigningSecret = keyring ? encryptSigningSecret(signingSecret, keyring) : signingSecret;
 
   await db
     .update(publishers)

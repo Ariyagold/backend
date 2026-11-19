@@ -270,10 +270,17 @@ export const envSchema = z.object({
   // AES-256 key used to encrypt per-publisher signing secrets at rest (#42).
   // Required when REQUIRE_REQUEST_SIGNATURE is true.
   SIGNING_SECRET_KEY: z.string().min(16).optional(),
+  // Comma-separated retired signing-secret keys kept for decryption only
+  // during a key rotation. New ciphertext always uses SIGNING_SECRET_KEY;
+  // run `npm run secrets:reencrypt` and then drop the old key from this list.
+  SIGNING_SECRET_LEGACY_KEYS: z.string().optional(),
 
   // AES-256 key used to encrypt webhook secrets at rest (#47).
   // Optional — when unset webhook secrets are NOT encrypted (logged as warning).
   WEBHOOK_ENCRYPTION_KEY: z.string().min(16).optional(),
+  // Comma-separated retired webhook encryption keys (decrypt-only), see
+  // SIGNING_SECRET_LEGACY_KEYS for the rotation procedure.
+  WEBHOOK_ENCRYPTION_LEGACY_KEYS: z.string().optional(),
 
   // Admin panel protection key (#49). Optional — when unset admin routes are
   // disabled (return 401) and a warning is logged at boot.

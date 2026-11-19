@@ -5,6 +5,7 @@ import { db } from "../db/client.js";
 import { publishers } from "../db/schema.js";
 import { hashApiKey } from "../utils/crypto.js";
 import { decryptSigningSecret } from "../utils/crypto.js";
+import { signingKeyring } from "../lib/secretKeys.js";
 import { AppError } from "../lib/errors.js";
 import {
   EMPTY_BODY_HASH,
@@ -194,9 +195,11 @@ export async function requestSignatureAuth(req: Request, res: Response, next: Ne
       return;
     }
 
-    // Decrypt if SIGNING_SECRET_KEY is configured (#42).
-    if (config.SIGNING_SECRET_KEY) {
-      const plain = decryptSigningSecret(row.signingSecret, config.SIGNING_SECRET_KEY);
+    // Decrypt if SIGNING_SECRET_KEY is configured (#42). Legacy keys from
+    // SIGNING_SECRET_LEGACY_KEYS are accepted during a key rotation.
+    const keyring = signingKeyring();
+    if (keyring) {
+      const plain = decryptSigningSecret(row.signingSecret, keyring);
       if (!plain) {
         fail("Invalid signing secret configuration");
         return;

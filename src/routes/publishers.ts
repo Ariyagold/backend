@@ -18,6 +18,7 @@ import { db } from "../db/client.js";
 import { publishers, resources, payments, webhookOutbox } from "../db/schema.js";
 import { config } from "../config.js";
 import { encryptWebhookSecret, decryptWebhookSecret } from "../utils/crypto.js";
+import { webhookKeyring } from "../lib/secretKeys.js";
 
 const router: RouterType = Router();
 
@@ -267,6 +268,7 @@ router.patch(
       throw new AppError("VALIDATION_ERROR", "webhookUrl is required to enable webhooks");
     }
 
+    const keyring = webhookKeyring();
     const [updated] = await db
       .update(publishers)
       .set({
@@ -275,8 +277,8 @@ router.patch(
           ? {
               webhookSecret: body.webhookSecret === null
                 ? null
-                : config.WEBHOOK_ENCRYPTION_KEY
-                  ? encryptWebhookSecret(body.webhookSecret, config.WEBHOOK_ENCRYPTION_KEY)
+                : keyring
+                  ? encryptWebhookSecret(body.webhookSecret, keyring)
                   : body.webhookSecret,
             }
           : {}),
@@ -306,9 +308,8 @@ router.post("/publishers/me/webhooks/test", apiKeyAuth, publisherRateLimit, asyn
   // Decrypt the stored secret before using it for HMAC signing (#47).
   let secret: string | undefined;
   if (pub.webhookSecret) {
-    secret = config.WEBHOOK_ENCRYPTION_KEY
-      ? (decryptWebhookSecret(pub.webhookSecret, config.WEBHOOK_ENCRYPTION_KEY) ?? pub.webhookSecret)
-      : pub.webhookSecret;
+    const keyring = webhookKeyring();
+    secret = keyring ? (decryptWebhookSecret(pub.webhookSecret, keyring) ?? pub.webhookSecret) : pub.webhookSecret;
   }
 
   // Single attempt: the caller is waiting on this request.
