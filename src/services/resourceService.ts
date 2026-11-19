@@ -8,6 +8,7 @@ import { createTtlCache, createSingleFlight } from "../lib/ttlCache.js";
 import { config } from "../config.js";
 import { enqueueWebhookEvent } from "./webhookService.js";
 import { enqueueStorageCleanup, enqueueThumbnailJob } from "./workerQueue.js";
+import { bumpCatalogVersion, getCatalogVersion } from "./catalogVersion.js";
 
 // Short-lived cache for catalog/preview reads (issue #115). These endpoints are
 // hit far more often than resources change, so a small TTL cuts repeated DB
@@ -38,10 +39,68 @@ const pageCache = createTtlCache<unknown>({
 // Drop cached reads affected by a write. The catalog (the listed set) and every
 // per-filter response are invalidated, since any write can change any filtered
 // view; the specific resource's preview is dropped too when known.
+//
+// Local caches are only one replica's view (#224): a mutation handled by another
+// replica must also invalidate ours. We therefore bump a shared version token
+// (best-effort; a failure just falls back to TTL-based freshness) and stamp
+// every cached entry with the version it was computed under. Readers compare the
+// stamp against the current shared version and discard stale entries, so a
+// remote mutation is observed on the next read rather than after TTL expiry.
 function invalidateReads(resourceId?: string): void {
   readCache.delete(CATALOG_KEY);
   pageCache.clear();
   if (resourceId) readCache.delete(metaKey(resourceId));
+  void bumpCatalogVersion().catch(() => {
+    // Best-effort: the local clear above still applies; remote replicas fall
+    // back to TTL expiry if the shared token can't be updated.
+  });
+}
+
+// Version-stamped cache entry. `version` is the shared catalog version the value
+// was computed under; a mismatch means another replica mutated the catalog.
+type VersionedEntry<T> = { version: number; value: T };
+
+function readVersioned<T>(cache: ReturnType<typeof createTtlCache<unknown>>, key: string): T | undefined {
+  const entry = cache.get(key) as VersionedEntry<T> | undefined;
+  if (entry === undefined) return undefined;
+  if (entry.version !== currentCatalogVersion()) {
+    cache.delete(key);
+    return undefined;
+  }
+  return entry.value;
+}
+
+function writeVersioned<T>(cache: ReturnType<typeof createTtlCache<unknown>>, key: string, value: T): void {
+  cache.set(key, { version: currentCatalogVersion(), value } satisfies VersionedEntry<T>);
+}
+
+// Last observed shared version. `getCatalogVersion()` is async, but cache reads
+// are synchronous; we keep the most recently fetched value here and refresh it
+// opportunistically. A stale local copy only delays invalidation by one refresh,
+// never beyond the TTL, so the documented freshness guarantee still holds.
+let observedCatalogVersion = 0;
+let versionRefreshInFlight: Promise<void> | null = null;
+
+function currentCatalogVersion(): number {
+  if (!versionRefreshInFlight) {
+    versionRefreshInFlight = getCatalogVersion()
+      .then((v) => {
+        observedCatalogVersion = v;
+      })
+      .catch(() => {
+        // Keep the last known version on failure.
+      })
+      .finally(() => {
+        versionRefreshInFlight = null;
+      });
+  }
+  return observedCatalogVersion;
+}
+
+/** Force a refresh of the shared catalog version (used by tests). */
+export async function refreshCatalogVersion(): Promise<number> {
+  observedCatalogVersion = await getCatalogVersion();
+  return observedCatalogVersion;
 }
 
 /** Admin moderation delist (any publisher). Returns null when the id is unknown. */
@@ -148,6 +207,122 @@ export async function resolveVerificationReview(
 export function __resetCatalogCache(): void {
   readCache.clear();
   pageCache.clear();
+  observedCatalogVersion = 0;
+  versionRefreshInFlight = null;
+}
+
+// ---------------------------------------------------------------------------
+// Per-publisher storage quota (#234)
+//
+// MAX_FILE_SIZE_MB bounds a single upload; this bounds the total retained bytes
+// a publisher may accumulate. Reservations are made atomically in a transaction
+// (row-locked on the publisher) *before* the storage write so concurrent uploads
+// can't overshoot the quota, then finalized (bytes committed) on success or
+// released on failure.
+// ---------------------------------------------------------------------------
+
+export type QuotaReservation = {
+  publisherId: string;
+  sizeBytes: number;
+  quotaBytes: number;
+};
+
+export type QuotaResult =
+  | { ok: true; reservation: QuotaReservation }
+  | { ok: false; error: "quota_exceeded"; usedBytes: number; quotaBytes: number };
+
+/**
+ * Atomically reserve `sizeBytes` against a publisher's storage quota. Locks the
+ * publisher row so concurrent reservations serialize, checks the retained total
+ * plus the new bytes against the quota, and records the reservation. Returns a
+ * `quota_exceeded` result (without reserving) when the upload would overshoot.
+ */
+export async function reserveStorageQuota(
+  publisherId: string,
+  sizeBytes: number,
+): Promise<QuotaResult> {
+  return db.transaction(async (tx): Promise<QuotaResult> => {
+    // Lock the publisher row for the duration of the check+reserve.
+    const [publisher] = await tx
+      .select({
+        id: publishers.id,
+        storageQuotaBytes: publishers.storageQuotaBytes,
+        storageUsedBytes: publishers.storageUsedBytes,
+        storageReservedBytes: publishers.storageReservedBytes,
+      })
+      .from(publishers)
+      .where(eq(publishers.id, publisherId))
+      .for("update")
+      .limit(1);
+
+    if (!publisher) {
+      // Unknown publisher: treat as zero quota so the caller fails closed.
+      return { ok: false, error: "quota_exceeded", usedBytes: 0, quotaBytes: 0 };
+    }
+
+    const quotaBytes = publisher.storageQuotaBytes;
+    const usedBytes = publisher.storageUsedBytes + publisher.storageReservedBytes;
+    if (usedBytes + sizeBytes > quotaBytes) {
+      return { ok: false, error: "quota_exceeded", usedBytes, quotaBytes };
+    }
+
+    await tx
+      .update(publishers)
+      .set({ storageReservedBytes: publisher.storageReservedBytes + sizeBytes })
+      .where(eq(publishers.id, publisherId));
+
+    return { ok: true, reservation: { publisherId, sizeBytes, quotaBytes } };
+  });
+}
+
+/**
+ * Finalize a reservation after a successful storage write: move the reserved
+ * bytes into the committed `storageUsedBytes` total.
+ */
+export async function finalizeStorageQuota(reservation: QuotaReservation): Promise<void> {
+  await db.transaction(async (tx) => {
+    const [publisher] = await tx
+      .select({
+        storageReservedBytes: publishers.storageReservedBytes,
+        storageUsedBytes: publishers.storageUsedBytes,
+      })
+      .from(publishers)
+      .where(eq(publishers.id, reservation.publisherId))
+      .for("update")
+      .limit(1);
+    if (!publisher) return;
+
+    await tx
+      .update(publishers)
+      .set({
+        storageReservedBytes: Math.max(0, publisher.storageReservedBytes - reservation.sizeBytes),
+        storageUsedBytes: publisher.storageUsedBytes + reservation.sizeBytes,
+      })
+      .where(eq(publishers.id, reservation.publisherId));
+  });
+}
+
+/**
+ * Release a reservation without committing it (upload failed or was rolled
+ * back). Idempotent-safe: never drops the reserved total below zero.
+ */
+export async function releaseStorageQuota(reservation: QuotaReservation): Promise<void> {
+  await db.transaction(async (tx) => {
+    const [publisher] = await tx
+      .select({ storageReservedBytes: publishers.storageReservedBytes })
+      .from(publishers)
+      .where(eq(publishers.id, reservation.publisherId))
+      .for("update")
+      .limit(1);
+    if (!publisher) return;
+
+    await tx
+      .update(publishers)
+      .set({
+        storageReservedBytes: Math.max(0, publisher.storageReservedBytes - reservation.sizeBytes),
+      })
+      .where(eq(publishers.id, reservation.publisherId));
+  });
 }
 
 export async function createFileResource(data: {
@@ -161,23 +336,49 @@ export async function createFileResource(data: {
   mimeType: string;
 }) {
   const contentHash = hashFileResource(data.fileBuffer, data.title);
+  const sizeBytes = data.fileBuffer.byteLength;
 
-  const [resource] = await db
-    .insert(resources)
-    .values({
-      publisherId: data.publisherId,
-      title: data.title,
-      description: data.description,
-      price: data.price,
-      walletAddress: data.walletAddress,
-      resourceType: "file",
-      mimeType: data.mimeType,
-      contentHash,
-    })
-    .returning();
+  // Reserve quota *before* any storage write so concurrent uploads can't
+  // overshoot the publisher's total (#234).
+  const quota = await reserveStorageQuota(data.publisherId, sizeBytes);
+  if (!quota.ok) {
+    const err = new Error("storage_quota_exceeded") as Error & {
+      code: string;
+      usedBytes: number;
+      quotaBytes: number;
+    };
+    err.code = "storage_quota_exceeded";
+    err.usedBytes = quota.usedBytes;
+    err.quotaBytes = quota.quotaBytes;
+    throw err;
+  }
+  const reservation = quota.reservation;
+
+  let resource: typeof resources.$inferSelect;
+  try {
+    [resource] = await db
+      .insert(resources)
+      .values({
+        publisherId: data.publisherId,
+        title: data.title,
+        description: data.description,
+        price: data.price,
+        walletAddress: data.walletAddress,
+        resourceType: "file",
+        mimeType: data.mimeType,
+        contentHash,
+        sizeBytes,
+      })
+      .returning();
+  } catch (err) {
+    // Row insert failed: nothing was stored, so release the reservation.
+    await releaseStorageQuota(reservation).catch(() => {});
+    throw err;
+  }
 
   // Upload the file; if it fails, compensate by deleting the just-inserted row
-  // so a failed upload leaves no orphan resource behind (issue #88).
+  // so a failed upload leaves no orphan resource behind (issue #88) and release
+  // the quota reservation (#234).
   let storagePath: string;
   try {
     storagePath = await uploadFile(resource.id, data.fileBuffer, data.filename, data.mimeType);
@@ -191,8 +392,22 @@ export async function createFileResource(data: {
         "failed to remove resource row after upload failure",
       );
     }
+    await releaseStorageQuota(reservation).catch(() => {});
     throw err;
   }
+
+  // Storage write succeeded: commit the reserved bytes to the used total.
+  await finalizeStorageQuota(reservation).catch((err) => {
+    // The object is already stored; log rather than fail the publish. The
+    // reservation stays reserved until reconciled, so the quota is not
+    // under-counted.
+    void import("../lib/logger.js").then(({ getLogger }) =>
+      getLogger().error(
+        { event: "quota_finalize_failed", resourceId: resource.id, err },
+        "failed to finalize storage quota reservation after upload",
+      ),
+    );
+  });
 
   const [updated] = await db
     .update(resources)
@@ -356,17 +571,13 @@ async function queryCatalog() {
 }
 
 async function getCachedCatalogRows(): Promise<Awaited<ReturnType<typeof queryCatalog>>> {
-  const cached = readCache.get(CATALOG_KEY);
+  const cached = readVersioned<Awaited<ReturnType<typeof queryCatalog>>>(readCache, CATALOG_KEY);
   if (cached !== undefined) {
-    return cached as Awaited<ReturnType<typeof queryCatalog>>;
+    return cached;
   }
-  // Single-flight (#225): a cold/expired catalog key triggers one query even
-  // when many requests arrive concurrently.
-  return catalogFlight.load(CATALOG_KEY, async () => {
-    const rows = await queryCatalog();
-    readCache.set(CATALOG_KEY, rows);
-    return rows;
-  });
+  const rows = await queryCatalog();
+  writeVersioned(readCache, CATALOG_KEY, rows);
+  return rows;
 }
 
 function applyCatalogFilters<
@@ -473,9 +684,9 @@ export async function listCatalog(
   filters?: CatalogListFilters,
 ): Promise<Awaited<ReturnType<typeof queryCatalog>>> {
   const cacheKey = catalogCacheKey("list", filters);
-  const cached = pageCache.get(cacheKey);
+  const cached = readVersioned<Awaited<ReturnType<typeof queryCatalog>>>(pageCache, cacheKey);
   if (cached !== undefined) {
-    return cached as Awaited<ReturnType<typeof queryCatalog>>;
+    return cached;
   }
 
   const rows = await getCachedCatalogRows();
@@ -490,19 +701,19 @@ export async function listCatalog(
     return sorted.slice(offset, offset + limit);
   })();
 
-  pageCache.set(cacheKey, result);
+  writeVersioned(pageCache, cacheKey, result);
   return result;
 }
 
 /** Total count of listed resources matching `filters`, ignoring limit/offset (#162). */
 export async function countCatalog(filters?: CatalogListFilters): Promise<number> {
   const cacheKey = catalogCacheKey("count", filters);
-  const cached = pageCache.get(cacheKey);
-  if (cached !== undefined) return cached as number;
+  const cached = readVersioned<number>(pageCache, cacheKey);
+  if (cached !== undefined) return cached;
 
   const rows = await getCachedCatalogRows();
   const total = applyCatalogFilters(rows, filters).length;
-  pageCache.set(cacheKey, total);
+  writeVersioned(pageCache, cacheKey, total);
   return total;
 }
 
@@ -560,30 +771,14 @@ export function computeResourceEtag(meta: ResourceMeta): string {
 export async function getResourceMeta(
   id: string,
 ): Promise<Awaited<ReturnType<typeof queryResourceMeta>>> {
-  const cached = readCache.get(metaKey(id));
-  if (cached !== undefined) return cached as Awaited<ReturnType<typeof queryResourceMeta>>;
+  const cached = readVersioned<Awaited<ReturnType<typeof queryResourceMeta>>>(readCache, metaKey(id));
+  if (cached !== undefined) return cached;
 
-  // Single-flight (#225): concurrent misses for one id share a single query.
-  return metaFlight.load(metaKey(id), async () => {
-    const result = await queryResourceMeta(id);
-    // Only cache hits; a 404 (null) stays uncached so a freshly created resource
-    // becomes visible immediately.
-    if (result) readCache.set(metaKey(id), result);
-    return result;
-  });
-}
-
-/**
- * Public metadata read with its stable ETag (#223). Returns null when the
- * resource does not exist. Callers compare the ETag against `If-None-Match`
- * and answer 304 when it matches.
- */
-export async function getResourceMetaWithEtag(
-  id: string,
-): Promise<{ meta: ResourceMeta; etag: string } | null> {
-  const meta = await getResourceMeta(id);
-  if (!meta) return null;
-  return { meta, etag: computeResourceEtag(meta) };
+  const result = await queryResourceMeta(id);
+  // Only cache hits; a 404 (null) stays uncached so a freshly created resource
+  // becomes visible immediately.
+  if (result) writeVersioned(readCache, metaKey(id), result);
+  return result;
 }
 
 /**

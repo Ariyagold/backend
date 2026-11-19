@@ -475,6 +475,40 @@ export const openApiSpec = {
         },
         required: ["entries", "total", "page", "limit"],
       },
+      ModerationEvent: {
+        type: "object",
+        description:
+          "An immutable moderation event recorded for a resource. Events are append-only: " +
+          "they are never updated or deleted, so the returned details are a stable history.",
+        properties: {
+          id: { type: "string" },
+          resourceId: { type: "string", nullable: true },
+          action: {
+            type: "string",
+            description: "Moderation action that was taken.",
+            example: "resource.delist",
+          },
+          actor: {
+            type: "string",
+            description: "Identifier of the admin or system actor that performed the action.",
+          },
+          reason: { type: "string", nullable: true },
+          details: { nullable: true, description: "Optional structured context captured with the event." },
+          createdAt: { type: "string", format: "date-time" },
+        },
+        required: ["id", "action", "actor", "createdAt"],
+      },
+      ModerationEventResponse: {
+        type: "object",
+        description: "Paginated, immutable moderation history.",
+        properties: {
+          events: { type: "array", items: { $ref: "#/components/schemas/ModerationEvent" } },
+          total: { type: "integer" },
+          page: { type: "integer" },
+          limit: { type: "integer" },
+        },
+        required: ["events", "total", "page", "limit"],
+      },
       MetricsResponse: {
         type: "object",
         description: "Service metrics snapshot for observability and monitoring.",
@@ -1322,13 +1356,66 @@ export const openApiSpec = {
         summary: "Access a resource (x402 paywalled)",
         operationId: "accessResource",
         description:
-          "Returns the resource content or a redirect URL after x402 payment. Responds with HTTP 402 if payment is missing.",
-        parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          "Returns the resource content or a redirect URL after x402 payment. Responds with HTTP 402 if payment is missing.\n\n" +
+          "**Byte ranges (large audio/video):** after payment authorization, file resources support a single " +
+          "`Range: bytes=start-end` request (either bound may be omitted, e.g. `bytes=0-`, `bytes=500-999`). " +
+          "A satisfiable range returns `206 Partial Content` with `Content-Range: bytes start-end/total`, " +
+          "`Accept-Ranges: bytes` and `Content-Length` set to the range length. An unsatisfiable range returns " +
+          "`416 Range Not Satisfiable` with `Content-Range: bytes */total`. Multiple ranges are not supported and " +
+          "are ignored (the full body is returned with `200`). Range retries and resumes reuse the same payment " +
+          "authorization and are never charged again; a range request without valid payment authorization still " +
+          "returns `402`.",
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string" } },
+          {
+            name: "Range",
+            in: "header",
+            required: false,
+            schema: { type: "string", example: "bytes=0-1048575" },
+            description:
+              "Single byte range for file resources, e.g. `bytes=start-end`. Omit both bounds to request the tail " +
+              "(`bytes=-N`) or the remainder (`bytes=N-`). Multiple ranges are ignored.",
+          },
+        ],
         security: [{ X402Payment: [] }],
         responses: {
-          "200": { description: "Resource content or link URL delivered" },
+          "200": {
+            description: "Resource content or link URL delivered (full body; no Range header or unsupported range).",
+            headers: {
+              "Accept-Ranges": {
+                schema: { type: "string", example: "bytes" },
+                description: "Present on file resources that support range requests.",
+              },
+            },
+          },
+          "206": {
+            description: "Partial content for a satisfiable single byte range.",
+            headers: {
+              "Content-Range": {
+                schema: { type: "string", example: "bytes 0-1048575/10485760" },
+                description: "Inclusive byte range delivered and the total resource size.",
+              },
+              "Accept-Ranges": {
+                schema: { type: "string", example: "bytes" },
+              },
+              "Content-Length": {
+                schema: { type: "integer" },
+                description: "Length of the delivered range in bytes.",
+              },
+            },
+          },
           "402": {
-            description: "Payment required (x402)",
+            description: "Payment required (x402); also returned for range requests without valid payment authorization.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+          "416": {
+            description: "Requested range is not satisfiable for the resource size.",
+            headers: {
+              "Content-Range": {
+                schema: { type: "string", example: "bytes */10485760" },
+                description: "Total resource size; no content is returned.",
+              },
+            },
             content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
           "404": {
@@ -1858,6 +1945,86 @@ export const openApiSpec = {
           "403": { description: "Resource was delisted by an administrator" },
           "404": { description: "Resource not found" },
           "409": { description: "Resource is not awaiting review" },
+        },
+      },
+    },
+    "/admin/moderation-events": {
+      get: {
+        tags: ["Admin"],
+        summary: "Read resource moderation history",
+        operationId: "listModerationEvents",
+        description:
+          "Admin-only, paginated read of the immutable moderation event history. " +
+          "Requires the `x-admin-key` header; missing or invalid keys return `401`. " +
+          "Results are ordered newest first and can be filtered by resource, actor and time window. " +
+          "Pagination uses 1-based `page` and `limit` (1-100, default 20); the response reports `total`, `page` and `limit`.",
+        security: [{ AdminKey: [] }],
+        parameters: [
+          {
+            name: "resourceId",
+            in: "query",
+            required: false,
+            schema: { type: "string" },
+            description: "Only include events for this resource id",
+          },
+          {
+            name: "actor",
+            in: "query",
+            required: false,
+            schema: { type: "string" },
+            description: "Only include events performed by this actor",
+          },
+          {
+            name: "action",
+            in: "query",
+            required: false,
+            schema: { type: "string" },
+            description: "Only include events with this action (e.g. `resource.delist`)",
+          },
+          {
+            name: "from",
+            in: "query",
+            required: false,
+            schema: { type: "string", format: "date-time" },
+            description: "Only include events at or after this timestamp",
+          },
+          {
+            name: "to",
+            in: "query",
+            required: false,
+            schema: { type: "string", format: "date-time" },
+            description: "Only include events at or before this timestamp",
+          },
+          {
+            name: "page",
+            in: "query",
+            required: false,
+            schema: { type: "integer", minimum: 1, default: 1 },
+            description: "Page number (1-based)",
+          },
+          {
+            name: "limit",
+            in: "query",
+            required: false,
+            schema: { type: "integer", minimum: 1, maximum: 100, default: 20 },
+            description: "Page size (1-100, default 20)",
+          },
+        ],
+        responses: {
+          "200": {
+            description: "Paginated moderation events, newest first",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/ModerationEventResponse" } },
+            },
+          },
+          "400": {
+            description: "Invalid filter or pagination parameters",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+          "401": {
+            description: "Missing or invalid admin key",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
         },
       },
     },

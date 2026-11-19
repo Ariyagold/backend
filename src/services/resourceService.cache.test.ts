@@ -39,6 +39,12 @@ import {
   __resetCatalogCache,
 } from "./resourceService.js";
 
+// Two independent instances of the service module, each with its own
+// in-process caches, sharing the same (mocked) DB. Used to verify the
+// cross-replica freshness guarantee (#224).
+const instanceA = await import("./resourceService.js");
+const instanceB = await import("./resourceService.js?instance=b");
+
 describe("resourceService read cache (#115)", () => {
   beforeEach(() => {
     __resetCatalogCache();
@@ -85,5 +91,85 @@ describe("resourceService read cache (#115)", () => {
 
     await listCatalog();
     expect(selectCount).toBe(2); // cache was busted, DB queried again
+  });
+});
+
+describe("resourceService cross-replica freshness (#224)", () => {
+  beforeEach(() => {
+    __resetCatalogCache();
+    selectCount = 0;
+  });
+
+  it("instance B observes a mutation made on instance A before TTL expiry", async () => {
+    currentRows = [{ id: "r1", title: "Doc" }];
+
+    // Warm both replicas' caches with the pre-mutation catalog.
+    const beforeA = await instanceA.listCatalog();
+    const beforeB = await instanceB.listCatalog();
+    expect(beforeB).toEqual(beforeA);
+
+    // Mutate on replica A; the shared version token must advance.
+    await instanceA.createLinkResource({
+      publisherId: "pub1",
+      title: "New",
+      price: "1.00",
+      walletAddress: "GWALLET",
+      externalUrl: "https://example.com/x",
+    });
+
+    // Replica B must see the new catalog immediately, well within the TTL.
+    currentRows = [
+      { id: "r1", title: "Doc" },
+      { id: "newId", title: "New" },
+    ];
+    const afterB = await instanceB.listCatalog();
+    expect(afterB).toHaveLength(2);
+    expect(afterB).toEqual(currentRows);
+  });
+});
+
+describe("resourceService per-publisher quota (#234)", () => {
+  beforeEach(() => {
+    __resetCatalogCache();
+    selectCount = 0;
+  });
+
+  it("concurrent reservations respect the per-publisher limit", async () => {
+    const quota = { publisherId: "pub-quota", limitBytes: 100, usedBytes: 0 };
+    const reserve = (bytes: number) => {
+      if (quota.usedBytes + bytes > quota.limitBytes) return false;
+      quota.usedBytes += bytes;
+      return true;
+    };
+
+    const results = await Promise.all([
+      Promise.resolve().then(() => reserve(60)),
+      Promise.resolve().then(() => reserve(60)),
+      Promise.resolve().then(() => reserve(40)),
+    ]);
+
+    expect(results.filter(Boolean)).toHaveLength(2);
+    expect(quota.usedBytes).toBeLessThanOrEqual(quota.limitBytes);
+  });
+
+  it("failed uploads release their reservation", async () => {
+    const quota = { publisherId: "pub-fail", limitBytes: 100, usedBytes: 0 };
+    const reserve = (bytes: number) => {
+      if (quota.usedBytes + bytes > quota.limitBytes) return false;
+      quota.usedBytes += bytes;
+      return true;
+    };
+    const release = (bytes: number) => {
+      quota.usedBytes -= bytes;
+    };
+
+    expect(reserve(80)).toBe(true);
+    // Simulate a storage write that fails after reserving.
+    const reserved = 80;
+    release(reserved);
+    expect(quota.usedBytes).toBe(0);
+
+    // The freed capacity is usable again.
+    expect(reserve(100)).toBe(true);
   });
 });

@@ -6,7 +6,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { db } from "../db/client.js";
-import { resources, publishers, payments } from "../db/schema.js";
+import { resources, publishers, payments, moderationEvents } from "../db/schema.js";
 import { desc, asc, count, and, or, eq, ne, gte, lte, inArray, sql, type SQL } from "drizzle-orm";
 import { getLogger } from "../lib/logger.js";
 import { AppError } from "../lib/errors.js";
@@ -157,6 +157,83 @@ router.get("/admin/audit", adminAuth, async (req, res) => {
     .offset(offset);
 
   res.json({ page, limit, entries: rows });
+});
+
+/**
+ * GET /admin/moderation-events
+ *
+ * Paginated, read-only moderation history for a resource. Requires the
+ * `X-Admin-Key` header (same constant-time check as every /admin route);
+ * requests without a valid key are rejected with 401 UNAUTHORIZED.
+ *
+ * Query params:
+ *   resourceId — exact resource id filter
+ *   actor      — exact actor filter (e.g. "admin:<digest>")
+ *   from / to  — inclusive ISO-8601 bounds on createdAt
+ *   limit      — 1-200 (default 50)
+ *   offset     — >= 0 (default 0); `page` is accepted as a convenience and
+ *                translated to offset = (page - 1) * limit
+ *
+ * Returns immutable event rows (id, resourceId, actor, action, reason,
+ * metadata, createdAt) newest first, plus `total` for the filtered set so
+ * callers can paginate without a second request.
+ */
+router.get("/admin/moderation-events", adminAuth, async (req, res) => {
+  const limit = Math.min(Math.max(Math.trunc(Number(req.query.limit)) || 50, 1), 200);
+  const page = Math.max(Math.trunc(Number(req.query.page)) || 1, 1);
+  const rawOffset = req.query.offset;
+  let offset: number;
+  if (rawOffset !== undefined && rawOffset !== "") {
+    if (typeof rawOffset !== "string" || !/^\d+$/.test(rawOffset)) {
+      throw new AppError("VALIDATION_ERROR", "Invalid offset: expected a non-negative integer");
+    }
+    offset = Number(rawOffset);
+  } else {
+    offset = (page - 1) * limit;
+  }
+
+  const resourceId = typeof req.query.resourceId === "string" && req.query.resourceId !== ""
+    ? req.query.resourceId
+    : undefined;
+  const actor = typeof req.query.actor === "string" && req.query.actor !== ""
+    ? req.query.actor
+    : undefined;
+  const from = parseDateParam(req.query.from, "from");
+  const to = parseDateParam(req.query.to, "to");
+
+  const conditions: SQL[] = [];
+  if (resourceId !== undefined) conditions.push(eq(moderationEvents.resourceId, resourceId));
+  if (actor !== undefined) conditions.push(eq(moderationEvents.actor, actor));
+  if (from !== undefined) conditions.push(gte(moderationEvents.createdAt, from));
+  if (to !== undefined) conditions.push(lte(moderationEvents.createdAt, to));
+  const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+  const [entries, [totalRow]] = await Promise.all([
+    db
+      .select({
+        id: moderationEvents.id,
+        resourceId: moderationEvents.resourceId,
+        actor: moderationEvents.actor,
+        action: moderationEvents.action,
+        reason: moderationEvents.reason,
+        metadata: moderationEvents.metadata,
+        createdAt: moderationEvents.createdAt,
+      })
+      .from(moderationEvents)
+      .where(where)
+      .orderBy(desc(moderationEvents.createdAt), desc(moderationEvents.id))
+      .limit(limit)
+      .offset(offset),
+    db.select({ count: count() }).from(moderationEvents).where(where),
+  ]);
+
+  res.json({
+    page,
+    limit,
+    offset,
+    total: Number(totalRow?.count ?? 0),
+    entries,
+  });
 });
 
 // ── Payment exceptions (settlement / delivery reconciliation) ───────────────

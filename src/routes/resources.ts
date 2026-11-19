@@ -27,7 +27,11 @@ import {
   delistResource,
   getResourceById,
 } from "../services/resourceService.js";
-import { downloadFile, StorageNotFoundError } from "../storage/supabaseStorage.js";
+import {
+  downloadFile,
+  downloadFileRange,
+  StorageNotFoundError,
+} from "../storage/supabaseStorage.js";
 import { db } from "../db/client.js";
 import { payments, resources } from "../db/schema.js";
 import { and, eq, inArray } from "drizzle-orm";
@@ -78,16 +82,53 @@ function assertSignedTx(signedXdr: string, expected: ExpectedSignedTx): void {
   }
 }
 
-// Evaluates an If-None-Match header against the current ETag (#223).
-// Supports weak/strong comparison and comma-separated lists, plus "*".
-function ifNoneMatchMatches(header: string | undefined, etag: string): boolean {
-  if (!header) return false;
-  const normalize = (v: string) => v.trim().replace(/^W\//, "");
-  const current = normalize(etag);
-  return header
-    .split(",")
-    .map((candidate) => candidate.trim())
-    .some((candidate) => candidate === "*" || normalize(candidate) === current);
+// Parses a single-range `Range` header (#233). Only the documented single-range
+// form `bytes=<start>-<end>` / `bytes=<start>-` / `bytes=-<suffix>` is supported;
+// multi-range requests are rejected as unsatisfiable rather than silently
+// returning only the first range. Returns null when no Range header is present.
+type ParsedRange = { start: number; end: number };
+
+function parseSingleRange(
+  header: string | undefined,
+  size: number,
+): { range: ParsedRange | null; unsatisfiable: boolean } {
+  if (!header) return { range: null, unsatisfiable: false };
+
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match) return { range: null, unsatisfiable: true };
+
+  const [, rawStart, rawEnd] = match;
+  if (rawStart === "" && rawEnd === "") return { range: null, unsatisfiable: true };
+
+  let start: number;
+  let end: number;
+
+  if (rawStart === "") {
+    // Suffix range: last N bytes.
+    const suffixLength = Number(rawEnd);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) {
+      return { range: null, unsatisfiable: true };
+    }
+    start = Math.max(0, size - suffixLength);
+    end = size - 1;
+  } else {
+    start = Number(rawStart);
+    if (!Number.isSafeInteger(start) || start < 0) {
+      return { range: null, unsatisfiable: true };
+    }
+    if (rawEnd === "") {
+      end = size - 1;
+    } else {
+      end = Number(rawEnd);
+      if (!Number.isSafeInteger(end) || end < start) {
+        return { range: null, unsatisfiable: true };
+      }
+      end = Math.min(end, size - 1);
+    }
+  }
+
+  if (size === 0 || start >= size) return { range: null, unsatisfiable: true };
+  return { range: { start, end }, unsatisfiable: false };
 }
 
 // Best-effort removal of a multer disk-stored temp file. Never throws.
@@ -206,17 +247,27 @@ router.post(
         const { title, description, price, walletAddress } = parsed.data;
 
         // Thumbnail generation happens asynchronously in a worker (#89), so
-        // the response does not wait on it.
-        const resource = await createFileResource({
-          publisherId: publisher.id,
-          title,
-          description,
-          price,
-          walletAddress: walletAddress || publisher.walletAddress,
-          fileBuffer: fileBuffer!,
-          filename: req.file.originalname,
-          mimeType: req.file.mimetype,
-        });
+        // the response does not wait on it. The per-publisher storage quota is
+        // reserved atomically inside createFileResource before the storage
+        // write, and released again if the write fails (#234).
+        let resource: Awaited<ReturnType<typeof createFileResource>>;
+        try {
+          resource = await createFileResource({
+            publisherId: publisher.id,
+            title,
+            description,
+            price,
+            walletAddress: walletAddress || publisher.walletAddress,
+            fileBuffer: fileBuffer!,
+            filename: req.file.originalname,
+            mimeType: req.file.mimetype,
+          });
+        } catch (err) {
+          // Quota rejection (or any other failure) is not a committed result —
+          // release the idempotency key so a corrected retry can proceed.
+          if (ownsReservation) await store.delete(scopedKey!);
+          throw err;
+        }
 
         await sendResult(201, {
           ...resource,
@@ -474,10 +525,33 @@ router.get("/resources/:id", dynamicPaywall, async (req, res) => {
   }
 
   // Fetch the content *before* recording the payment so a storage failure
-  // never leaves a silently undelivered purchase.
+  // never leaves a silently undelivered purchase. Range requests (#233) are
+  // authorized by the same paywall middleware: a retry that reuses the same
+  // settlement key hits the unique constraint in recordPayment and reuses the
+  // existing authorization instead of charging again.
+  const rangeHeader = req.headers.range;
+  const rangeValue = Array.isArray(rangeHeader) ? rangeHeader[0] : rangeHeader;
+
   let fileContent: Awaited<ReturnType<typeof downloadFile>>;
+  let range: ParsedRange | null = null;
+  let unsatisfiable = false;
   try {
-    fileContent = await downloadFile(resource.storagePath);
+    if (rangeValue) {
+      // Range delivery needs the object size up front to validate the range.
+      const head = await downloadFile(resource.storagePath);
+      const parsedRange = parseSingleRange(rangeValue, head.buffer.length);
+      if (parsedRange.unsatisfiable) {
+        unsatisfiable = true;
+        fileContent = head;
+      } else {
+        range = parsedRange.range;
+        fileContent = range
+          ? await downloadFileRange(resource.storagePath, range.start, range.end)
+          : head;
+      }
+    } else {
+      fileContent = await downloadFile(resource.storagePath);
+    }
   } catch (err) {
     const payment = await recordPayment("undelivered");
     getLogger().error(
@@ -497,6 +571,19 @@ router.get("/resources/:id", dynamicPaywall, async (req, res) => {
     });
   }
 
+  // An unsatisfiable range is not a delivery: the purchase stays authorized
+  // (recorded as undelivered) so the client can retry with a valid range
+  // without being charged again.
+  if (unsatisfiable) {
+    const payment = await recordPayment("undelivered");
+    res.status(416);
+    res.setHeader("Content-Range", `bytes */${fileContent.buffer.length}`);
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("X-Payment-Id", payment.id);
+    res.end();
+    return;
+  }
+
   const payment = await recordPayment("delivered");
 
   // Add receipt info in headers for file downloads
@@ -510,7 +597,15 @@ router.get("/resources/:id", dynamicPaywall, async (req, res) => {
   const { buffer, mimeType } = fileContent;
   res.setHeader("Content-Type", mimeType);
   res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Accept-Ranges", "bytes");
   res.setHeader("Content-Disposition", attachmentDisposition(resource.storagePath.split("/").pop() ?? ""));
+
+  if (range) {
+    res.status(206);
+    res.setHeader("Content-Range", `bytes ${range.start}-${range.end}/${fileContent.buffer.length}`);
+    res.setHeader("Content-Length", String(buffer.length));
+  }
+
   res.send(buffer);
 });
 
