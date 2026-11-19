@@ -9,6 +9,7 @@ import { AppError } from "../lib/errors.js";
 import {
   EMPTY_BODY_HASH,
   getRequestPath,
+  hashFile,
   hashMultipartBody,
   hashRequestBody,
   isTimestampWithinSkew,
@@ -106,15 +107,22 @@ async function checkAndMarkReplay(signature: string, ttlMs: number): Promise<boo
 
 // ── Body hashing ─────────────────────────────────────────────────────────────
 
-function resolveBodyHash(req: Request): string {
+async function resolveBodyHash(req: Request): Promise<string> {
   const contentType = req.headers["content-type"] ?? "";
 
   if (contentType.includes("multipart/form-data")) {
+    const fields = (req.body ?? {}) as Record<string, unknown>;
     const file = req.file as Express.Multer.File | undefined;
-    return hashMultipartBody(
-      req.body as Record<string, unknown>,
-      file ? { buffer: file.buffer } : undefined,
-    );
+    if (!file) return hashMultipartBody(fields);
+    // multer diskStorage exposes `path` (no `buffer`); hash the bytes that were
+    // actually written to disk using bounded streaming reads.
+    if (typeof file.path === "string" && file.path !== "") {
+      return hashMultipartBody(fields, { sha256: await hashFile(file.path) });
+    }
+    if (Buffer.isBuffer(file.buffer)) {
+      return hashMultipartBody(fields, { buffer: file.buffer });
+    }
+    throw new Error("Uploaded file has neither a disk path nor an in-memory buffer");
   }
 
   if (req.rawBody !== undefined) {
@@ -210,13 +218,22 @@ export async function requestSignatureAuth(req: Request, res: Response, next: Ne
     return;
   }
 
+  let bodyHash: string;
+  try {
+    bodyHash = await resolveBodyHash(req);
+  } catch (err) {
+    rootLogger.warn({ event: "request_signature_body_hash_failed", err }, "failed to hash request body for signature check");
+    fail("Unable to verify request body");
+    return;
+  }
+
   const idempotencyHeader = req.headers["idempotency-key"];
   const valid = verifyRequestSignature({
     secret: signingSecret,
     method: req.method,
     path: getRequestPath(req.originalUrl),
     timestamp: timestampHeader,
-    bodyHash: resolveBodyHash(req),
+    bodyHash,
     idempotencyKey: typeof idempotencyHeader === "string" ? idempotencyHeader : undefined,
     signature: signatureHeader,
   });

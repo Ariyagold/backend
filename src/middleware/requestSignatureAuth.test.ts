@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import nodePath from "node:path";
 import type { Request, Response, NextFunction } from "express";
 
 const TEST_SIGNING_SECRET = "svs_test_signing_secret_value_for_hmac";
@@ -39,6 +42,7 @@ vi.mock("../utils/crypto.js", async (importOriginal) => ({
 import { __resetSignatureReplayCache, requestSignatureAuth } from "./requestSignatureAuth.js";
 import {
   EMPTY_BODY_HASH,
+  hashMultipartBody,
   hashRequestBody,
   signPublisherRequest,
 } from "../utils/requestSignature.js";
@@ -317,5 +321,77 @@ describe("requestSignatureAuth disabled", () => {
 
     await disabledAuth(req, res, next);
     expect(next).toHaveBeenCalledWith();
+  });
+});
+
+describe("requestSignatureAuth multipart disk-backed uploads", () => {
+  const secret = TEST_SIGNING_SECRET;
+  const path = "/resources";
+  const fields = { title: "Doc", price: "1.00" };
+  const original = Buffer.from("original file bytes ".repeat(10_000)); // > one 64 KiB chunk
+  let dir: string;
+  let filePath: string;
+
+  const sign = (timestamp: string) =>
+    signPublisherRequest({
+      secret,
+      method: "POST",
+      path,
+      timestamp,
+      bodyHash: hashMultipartBody(fields, { buffer: original }),
+    });
+
+  const makeReq = (timestamp: string, signature: string, file: Partial<Express.Multer.File>) =>
+    ({
+      method: "POST",
+      originalUrl: path,
+      headers: {
+        "content-type": "multipart/form-data; boundary=x",
+        "x-api-key": "any_api_key",
+        "x-timestamp": timestamp,
+        "x-signature": signature,
+      },
+      body: { ...fields },
+      file,
+    }) as unknown as Request;
+
+  beforeEach(async () => {
+    __resetSignatureReplayCache();
+    dir = await mkdtemp(nodePath.join(os.tmpdir(), "sig-upload-"));
+    filePath = nodePath.join(dir, "upload.bin");
+    await writeFile(filePath, original);
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("accepts a signature over the bytes stored by multer diskStorage", async () => {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const next = vi.fn() as NextFunction;
+    await requestSignatureAuth(makeReq(timestamp, sign(timestamp), { path: filePath }), mockResponse(), next);
+    expect(next).toHaveBeenCalledWith();
+  });
+
+  it("rejects when the file bytes on disk were tampered with but fields and signature are unchanged", async () => {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const tampered = Buffer.from(original);
+    tampered[tampered.length - 1] ^= 0xff;
+    await writeFile(filePath, tampered);
+
+    const next = vi.fn() as NextFunction;
+    await requestSignatureAuth(makeReq(timestamp, sign(timestamp), { path: filePath }), mockResponse(), next);
+    expectRejected(next, "Invalid request signature");
+  });
+
+  it("rejects when the uploaded file cannot be read", async () => {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const next = vi.fn() as NextFunction;
+    await requestSignatureAuth(
+      makeReq(timestamp, sign(timestamp), { path: nodePath.join(dir, "missing.bin") }),
+      mockResponse(),
+      next,
+    );
+    expectRejected(next, "Unable to verify request body");
   });
 });
