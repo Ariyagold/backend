@@ -16,6 +16,7 @@ import { startRetryPendingWorker, stopRetryPendingWorker } from "./workers/retry
 import { startEventListener, stopEventListener } from "./workers/eventListener.js";
 import { startWebhookOutboxWorker, stopWebhookOutboxWorker } from "./workers/webhookOutboxWorker.js";
 import { closeRateLimitStore } from "./lib/rateLimit/index.js";
+import { closeSignatureReplayStore } from "./middleware/requestSignatureAuth.js";
 // Advisory lock key used to elect a single leader across replicas. Only the
 // instance holding this lock runs the background workers, so scaling out does
 // not duplicate RPC load or let replicas write the same rows concurrently.
@@ -232,6 +233,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
   try {
     await closeRateLimitStore();
+    await closeSignatureReplayStore();
     await releaseWorkerLeaderLock();
     await pgClient.end({ timeout: 5 });
     const forced = timedOut && inFlightCount() > 0;
