@@ -258,6 +258,10 @@ export const envSchema = z.object({
 
   // Optional Redis URL for a shared sliding-window rate-limit store (multi-instance).
   REDIS_URL: z.string().url().optional(),
+  // Max time a signed mutation waits for the shared replay-cache Redis
+  // connection to become ready (cold start / reconnect) before the replay
+  // check gives up on Redis. Also the socket connect timeout.
+  REPLAY_REDIS_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(1).max(30_000).default(2_000),
 
   // Background workers (event listener + retry worker). When multiple replicas
   // run, only one should execute them: either set WORKERS_ENABLED=false on all

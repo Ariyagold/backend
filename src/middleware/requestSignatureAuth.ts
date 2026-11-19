@@ -43,39 +43,78 @@ const pruneTimer = setInterval(() => {
 }, 60_000);
 pruneTimer.unref(); // don't keep the process alive
 
-let redisClient: import("redis").RedisClientType | null = null;
-let redisConnectPromise: Promise<void> | null = null;
+type RedisClient = import("redis").RedisClientType;
 
-function getRedisClient(): import("redis").RedisClientType | null {
-  if (!config.REDIS_URL) return null;
-  if (redisClient?.isOpen) return redisClient;
-  if (!redisConnectPromise) {
-    redisConnectPromise = (async () => {
-      try {
-        const { createClient } = await import("redis");
-        const client = createClient({
-          url: config.REDIS_URL,
-          socket: {
-            connectTimeout: 5_000,
-            reconnectStrategy: (retries: number) =>
-              retries >= 3 ? new Error("Redis unreachable") : 200 * (retries + 1),
-          },
-        });
-        client.on("error", () => {});
-        client.on("end", () => {
+let redisClient: RedisClient | null = null;
+let redisConnectPromise: Promise<RedisClient | null> | null = null;
+
+/** Open one shared Redis connection; resolves null (and allows a retry) on failure. */
+function connectRedis(): Promise<RedisClient | null> {
+  return (async () => {
+    try {
+      const { createClient } = await import("redis");
+      const client = createClient({
+        url: config.REDIS_URL,
+        // Fail commands fast while disconnected instead of queueing them, so
+        // a replay check never silently waits on a dead connection.
+        disableOfflineQueue: true,
+        socket: {
+          connectTimeout: config.REPLAY_REDIS_CONNECT_TIMEOUT_MS,
+          reconnectStrategy: (retries: number) =>
+            retries >= 3 ? new Error("Redis unreachable") : 200 * (retries + 1),
+        },
+      }) as RedisClient;
+      client.on("error", () => {});
+      client.on("end", () => {
+        if (redisClient === client) {
           redisClient = null;
           redisConnectPromise = null;
-        });
-        await client.connect();
-        redisClient = client as import("redis").RedisClientType;
-      } catch (err) {
-        rootLogger.warn({ event: "replay_cache_redis_unavailable", err }, "Redis replay cache unavailable — falling back to in-process cache");
-        redisClient = null;
-        redisConnectPromise = null;
-      }
-    })();
+        }
+      });
+      await client.connect();
+      redisClient = client;
+      return client;
+    } catch (err) {
+      rootLogger.warn({ event: "replay_cache_redis_unavailable", err }, "Redis replay cache unavailable");
+      redisClient = null;
+      redisConnectPromise = null;
+      return null;
+    }
+  })();
+}
+
+/** Resolve with `promise`, or with null after `ms` (the underlying work continues). */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Return a ready shared Redis client, waiting (bounded by
+ * REPLAY_REDIS_CONNECT_TIMEOUT_MS) for the initial connection so cold-start
+ * requests use the shared store instead of per-process memory. Returns null
+ * when Redis is not configured, or not ready within the bound.
+ */
+async function getRedisClient(): Promise<RedisClient | null> {
+  if (!config.REDIS_URL) return null;
+  if (redisClient?.isReady) return redisClient;
+
+  // A client that exhausted its reconnect budget is closed for good — drop
+  // it so the next call opens a fresh connection (recovery after an outage).
+  if (redisClient && !redisClient.isOpen) {
+    const stale = redisClient;
+    redisClient = null;
+    redisConnectPromise = null;
+    void stale.disconnect().catch(() => {});
   }
-  return null; // will be non-null after connect resolves
+
+  if (!redisConnectPromise) redisConnectPromise = connectRedis();
+  const client = await withTimeout(redisConnectPromise, config.REPLAY_REDIS_CONNECT_TIMEOUT_MS);
+  return client?.isReady ? client : null;
 }
 
 /**
@@ -83,7 +122,7 @@ function getRedisClient(): import("redis").RedisClientType | null {
  * Returns true when the signature has already been used (replay).
  */
 async function checkAndMarkReplay(signature: string, ttlMs: number): Promise<boolean> {
-  const redis = getRedisClient();
+  const redis = await getRedisClient();
   if (redis) {
     // SET NX with TTL — atomic; works across replicas (#43).
     const key = `replay:${signature}`;
@@ -240,7 +279,11 @@ export async function requestSignatureAuth(req: Request, res: Response, next: Ne
   next();
 }
 
-/** Test helper — forget previously accepted signatures (in-process cache only). */
+/** Test helper — forget previously accepted signatures and drop the Redis client. */
 export function __resetSignatureReplayCache(): void {
   inMemoryCache.clear();
+  const client = redisClient;
+  redisClient = null;
+  redisConnectPromise = null;
+  if (client) void client.disconnect().catch(() => {});
 }
