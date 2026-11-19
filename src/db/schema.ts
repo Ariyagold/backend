@@ -257,7 +257,8 @@ export const payments = pgTable(
     // agent earnings are summed from these rows (#99).
     verificationId: text("verification_id").references(() => verifications.id),
     // Delivery state of the purchased content: "delivered" once the file was
-    // served, "undelivered" when the download failed after payment (#86).
+    // served, "undelivered" when the download failed after payment (#86),
+    // "pending" while streaming, "aborted" if the response closed early (#194).
     deliveryStatus: text("delivery_status").notNull().default("delivered"),
     // Settlement state of the payment. Only settled payments count toward
     // earnings (#99).

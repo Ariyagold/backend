@@ -13,7 +13,7 @@ import {
 import { registerPublisher, getPublisherResources, rotateApiKey, rotateSigningSecret } from "../services/publisherService.js";
 import { deliver, webhookUrlProblem } from "../services/webhookService.js";
 import { replayWebhookDelivery } from "../workers/webhookOutboxWorker.js";
-import { eq, inArray, sum, count, sql, desc } from "drizzle-orm";
+import { eq, and, isNull, inArray, sum, count, sql, desc } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { publishers, resources, payments, webhookOutbox } from "../db/schema.js";
 import { config } from "../config.js";
@@ -408,7 +408,8 @@ router.get("/publishers/leaderboard", async (_req, res) => {
       amount: payments.amount,
       paidAt: payments.paidAt,
     })
-    .from(payments);
+    .from(payments)
+    .where(and(eq(payments.status, "settled"), isNull(payments.verificationId)));
 
   const leaderboard = allPublishers.map((pub) => {
     const pubResources = allResources.filter((r) => r.publisherId === pub.id);

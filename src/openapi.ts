@@ -410,6 +410,16 @@ export const openApiSpec = {
             },
           },
           issuedAt: { type: "string", format: "date-time" },
+          status: {
+            type: "string",
+            enum: ["pending", "settled", "failed"],
+            description: "Settlement state of the payment.",
+          },
+          deliveryStatus: {
+            type: "string",
+            enum: ["pending", "delivered", "undelivered", "aborted"],
+            description: "Content delivery state; undelivered/aborted purchases can be recovered via /payments/{id}/recover once settled.",
+          },
         },
         required: ["payment", "issuedAt"],
       },
