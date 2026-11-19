@@ -5,6 +5,7 @@ import { db } from "../db/client.js";
 import { payments, publishers } from "../db/schema.js";
 import { AppError } from "../lib/errors.js";
 import { hashApiKey } from "../utils/crypto.js";
+import { toReceiptTerms } from "../lib/purchaseSnapshot.js";
 
 const router: RouterType = Router();
 const WALLET_SIGNATURE_MAX_AGE_SECONDS = 300;
@@ -63,6 +64,12 @@ router.get("/payments/:id/receipt", async (req, res) => {
       payerAddress: payments.payerAddress,
       recipientAddress: payments.recipientAddress,
       paidAt: payments.paidAt,
+      receiptVersion: payments.receiptVersion,
+      network: payments.network,
+      asset: payments.asset,
+      resourceTitle: payments.resourceTitle,
+      resourceType: payments.resourceType,
+      resourceContentHash: payments.resourceContentHash,
     })
     .from(payments)
     .where(eq(payments.id, id))
@@ -78,7 +85,15 @@ router.get("/payments/:id/receipt", async (req, res) => {
     throw new AppError("FORBIDDEN", "This receipt is not available to this caller");
   }
 
-  res.json(payment);
+  // Terms come from the purchase-time snapshot, never from the resource's
+  // current state; legacy rows are flagged rather than back-filled.
+  const {
+    receiptVersion, network, asset, resourceTitle, resourceType, resourceContentHash, ...base
+  } = payment;
+  res.json({
+    ...base,
+    terms: toReceiptTerms({ receiptVersion, network, asset, resourceTitle, resourceType, resourceContentHash }),
+  });
 });
 
 // GET /buyers/:address/payments — buyer payment history

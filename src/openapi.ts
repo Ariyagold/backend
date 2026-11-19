@@ -410,6 +410,30 @@ export const openApiSpec = {
             },
           },
           issuedAt: { type: "string", format: "date-time" },
+          terms: {
+            type: "object",
+            description:
+              "Content identity and pricing terms snapshotted at purchase time. Rows recorded before snapshots existed are returned with legacy=true and null network/asset/content; they are never back-filled from current resource state.",
+            properties: {
+              version: { type: "integer", nullable: true },
+              legacy: { type: "boolean" },
+              network: { type: "string", nullable: true, example: "stellar:testnet" },
+              asset: {
+                type: "object",
+                nullable: true,
+                properties: { code: { type: "string", example: "USDC" }, contract: { type: "string" } },
+              },
+              content: {
+                type: "object",
+                nullable: true,
+                properties: {
+                  title: { type: "string", nullable: true },
+                  type: { type: "string", nullable: true },
+                  contentHash: { type: "string", nullable: true },
+                },
+              },
+            },
+          },
         },
         required: ["payment", "issuedAt"],
       },

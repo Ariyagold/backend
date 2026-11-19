@@ -51,7 +51,34 @@ describe("GET /payments/:id/receipt", () => {
     rows([payment]);
     const res = await request(app()).get(receiptPath).set(auth(payer, receiptPath));
     expect(res.status).toBe(200);
-    expect(res.body).toEqual(payment);
+    expect(res.body).toEqual({
+      ...payment,
+      terms: { version: null, legacy: true, network: null, asset: null, content: null },
+    });
+  });
+
+  it("returns snapshotted terms, not current resource state, for a versioned receipt", async () => {
+    rows([{
+      ...payment,
+      receiptVersion: 1,
+      network: "stellar:testnet",
+      asset: "CUSDC",
+      resourceTitle: "Original title",
+      resourceType: "file",
+      resourceContentHash: "hash-at-purchase",
+    }]);
+    const res = await request(app()).get(receiptPath).set(auth(payer, receiptPath));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ...payment,
+      terms: {
+        version: 1,
+        legacy: false,
+        network: "stellar:testnet",
+        asset: { code: "USDC", contract: "CUSDC" },
+        content: { title: "Original title", type: "file", contentHash: "hash-at-purchase" },
+      },
+    });
   });
 
   it("returns a receipt to the recipient authenticated with an API key", async () => {
@@ -59,7 +86,8 @@ describe("GET /payments/:id/receipt", () => {
     rows([payment]);
     const res = await request(app()).get(receiptPath).set("x-api-key", "publisher-key");
     expect(res.status).toBe(200);
-    expect(res.body).toEqual(payment);
+    expect(res.body).toMatchObject(payment);
+    expect(res.body.terms.legacy).toBe(true);
   });
 
   it("rejects unauthenticated requests before querying payments", async () => {

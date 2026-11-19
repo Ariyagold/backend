@@ -262,6 +262,16 @@ export const payments = pgTable(
     // Settlement state of the payment. Only settled payments count toward
     // earnings (#99).
     status: paymentStatusEnum("status").notNull().default("pending"),
+    // Purchase snapshot — what was bought and on what terms, frozen at
+    // purchase time so receipts survive later resource edits. NULL
+    // receipt_version marks a legacy row recorded before snapshots existed;
+    // those are never back-filled (see src/lib/purchaseSnapshot.ts).
+    receiptVersion: integer("receipt_version"),
+    network: text("network"),
+    asset: text("asset"),
+    resourceTitle: text("resource_title"),
+    resourceType: text("resource_type"),
+    resourceContentHash: text("resource_content_hash"),
     paidAt: timestamp("paid_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
