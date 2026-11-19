@@ -1670,7 +1670,13 @@ export const openApiSpec = {
           "for link resources, the external URL. The result sets the resource to `verified` (and listed) or `rejected`. " +
           "Ownership, the admin delist and the content match are checked before payment, so a refused request is not charged. " +
           "Resources delisted by an administrator cannot be relisted this way.\n\n" +
-          "**Without `resourceId`:** anonymous paid check; nothing is stored against a resource.",
+          "**Without `resourceId`:** anonymous paid check; nothing is stored against a resource.\n\n" +
+          "**Review input contract (`content-v1`, persisted as `input_contract_version`):** the paid verdict covers ONLY the submitted `content` string — " +
+          "the UTF-8 text of the file (first 10,000 characters) for file resources, or the URL string for link resources (the target is never fetched). " +
+          "Listing title/description are not reviewed.\n\n" +
+          "**Outcomes:** low-confidence or injection-flagged results set the resource to `review_required` (held for an admin; see `/admin/verification-reviews`) instead of `rejected`. " +
+          "If the model provider fails or returns an unusable response the endpoint returns `503` with a retryable error: nothing is stored, any existing verdict is kept, and the x402 payment is not settled (no fee). " +
+          "If the client disconnects, the model call is aborted, nothing is stored and no fee is settled.",
         security: [{ X402Payment: [] }, { ApiKeyAuth: [] }],
         requestBody: {
           required: true,
@@ -1794,6 +1800,40 @@ export const openApiSpec = {
             description: "Resource not found",
             content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
+        },
+      },
+    },
+    "/admin/verification-reviews": {
+      get: {
+        tags: ["Admin"],
+        summary: "List resources held for manual verification review",
+        operationId: "listVerificationReviews",
+        security: [{ AdminKey: [] }],
+        responses: {
+          "200": { description: "Review queue (oldest first)" },
+          "401": {
+            description: "Missing or invalid admin key",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+        },
+      },
+    },
+    "/admin/verification-reviews/{id}/resolve": {
+      post: {
+        tags: ["Admin"],
+        summary: "Approve or reject a held verification",
+        operationId: "resolveVerificationReview",
+        description:
+          "Body `{ decision: 'approve' | 'reject', reason: string }`. The decision, reason and actor are recorded in the moderation audit log. Admin-delisted resources cannot be approved/relisted (403).",
+        security: [{ AdminKey: [] }],
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+        responses: {
+          "200": { description: "Resolved" },
+          "400": { description: "Invalid decision or missing reason" },
+          "401": { description: "Missing or invalid admin key" },
+          "403": { description: "Resource was delisted by an administrator" },
+          "404": { description: "Resource not found" },
+          "409": { description: "Resource is not awaiting review" },
         },
       },
     },

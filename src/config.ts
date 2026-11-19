@@ -221,6 +221,8 @@ export const envSchema = z.object({
 
   // Verification
   VERIFICATION_PRICE: z.string().default("0.10"),
+  // Hard deadline for the verification model call, in ms (#184).
+  VERIFICATION_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
   // OpenRouter token pricing (USD per 1M tokens) used to estimate the cost of
   // each verification (#283). Defaults track anthropic/claude-sonnet-4 list
   // pricing; override per model if you change OPENROUTER_MODEL.

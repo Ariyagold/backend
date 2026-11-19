@@ -46,6 +46,10 @@ vi.mock('../db/client.js', () => {
 
 vi.mock('../services/resourceService.js', () => ({
   adminDelistResource: vi.fn(),
+  listVerificationReviewQueue: vi.fn(async () => [{ id: 'r1' }]),
+  resolveVerificationReview: vi.fn(async (id: string) =>
+    id === 'delisted' ? { ok: false, error: 'delisted' } : { ok: true, id, status: 'verified' },
+  ),
 }));
 
 vi.mock('../lib/logger.js', () => ({
@@ -246,5 +250,43 @@ describe('admin routes', () => {
       expect(chain2.limitMock).toHaveBeenLastCalledWith(1);
       expect(chain2.offsetMock).toHaveBeenLastCalledWith(2);
     });
+  });
+});
+
+describe('verification review workflow (#188)', () => {
+  beforeEach(() => {
+    mockConfig.ADMIN_API_KEY = 'k';
+  });
+
+  it('requires the admin key', async () => {
+    const res = await request(buildApp()).get('/admin/verification-reviews');
+    expect(res.status).toBe(401);
+  });
+
+  it('lists the queue', async () => {
+    const res = await request(buildApp()).get('/admin/verification-reviews').set('x-admin-key', 'k');
+    expect(res.status).toBe(200);
+    expect(res.body.entries).toEqual([{ id: 'r1' }]);
+  });
+
+  it('requires a reason and valid decision', async () => {
+    const res = await request(buildApp())
+      .post('/admin/verification-reviews/r1/resolve')
+      .set('x-admin-key', 'k')
+      .send({ decision: 'approve' });
+    expect(res.status).toBe(400);
+  });
+
+  it('resolves, and refuses admin-delisted resources', async () => {
+    const ok = await request(buildApp())
+      .post('/admin/verification-reviews/r1/resolve')
+      .set('x-admin-key', 'k')
+      .send({ decision: 'approve', reason: 'looks fine' });
+    expect(ok.status).toBe(200);
+    const blocked = await request(buildApp())
+      .post('/admin/verification-reviews/delisted/resolve')
+      .set('x-admin-key', 'k')
+      .send({ decision: 'approve', reason: 'x' });
+    expect(blocked.status).toBe(403);
   });
 });

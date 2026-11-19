@@ -55,11 +55,41 @@ describe("checkOriginality token usage", () => {
       usage: { prompt_tokens: 10, completion_tokens: 0, total_tokens: 10 },
     });
 
-    const result = await checkOriginality("x", "text");
+    // Unusable output is a retryable provider failure, not a verdict (#187).
+    await expect(checkOriginality("x", "text")).rejects.toMatchObject({
+      name: "VerificationProviderError",
+      retryable: true,
+      reason: "unparsable_response",
+    });
+  });
 
-    expect(result.isOriginal).toBe(false);
-    expect(result.usage.promptTokens).toBe(10);
-    expect(result.usage.totalTokens).toBe(10);
+  it("throws a retryable provider error on an empty response (#187)", async () => {
+    mockCreate.mockResolvedValue({ choices: [{ message: { content: "" } }] });
+    await expect(checkOriginality("x", "text")).rejects.toMatchObject({ reason: "empty_response" });
+  });
+
+  it("passes the cancellation signal upstream and stops on abort (#184)", async () => {
+    const ctrl = new AbortController();
+    let seen: AbortSignal | undefined;
+    mockCreate.mockImplementationOnce(async (_body: unknown, opts?: { signal: AbortSignal }) => {
+      seen = opts?.signal;
+      ctrl.abort();
+      throw new Error("aborted");
+    });
+    await expect(checkOriginality("x", "text", { signal: ctrl.signal })).rejects.toMatchObject({
+      name: "VerificationCanceledError",
+    });
+    expect(seen).toBeDefined();
+  });
+
+  it("reports the review-input contract version and needsReview (#188, #189)", async () => {
+    mockCreate.mockResolvedValue({
+      choices: [{ message: { content: '{"is_original":true,"confidence":0.4,"flags":[]}' } }],
+    });
+    const result = await checkOriginality("https://example.com/x", "link");
+    expect(result.inputContractVersion).toBe("content-v1");
+    expect(result.needsReview).toBe(true);
+    expect(mockCreate.mock.calls.at(-1)![0].messages[1].content).toContain("link submission");
   });
 
   it("defaults usage to zero when the model omits usage data", async () => {
