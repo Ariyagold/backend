@@ -7,7 +7,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { db } from "../db/client.js";
 import { resources, publishers, payments } from "../db/schema.js";
-import { desc, count, and, eq, gte, lte, type SQL } from "drizzle-orm";
+import { desc, asc, count, and, or, eq, ne, gte, lte, inArray, sql, type SQL } from "drizzle-orm";
 import { getLogger } from "../lib/logger.js";
 import { AppError } from "../lib/errors.js";
 import { adminDelistResource } from "../services/resourceService.js";
@@ -106,6 +106,135 @@ router.get("/admin/audit", adminAuth, async (req, res) => {
     .offset(offset);
 
   res.json({ page, limit, entries: rows });
+});
+
+// ── Payment exceptions (settlement / delivery reconciliation) ───────────────
+
+const SETTLEMENT_STATES = ["pending", "settled", "failed"] as const;
+const DELIVERY_STATES = ["delivered", "undelivered"] as const;
+const EXCEPTION_MAX_LIMIT = 200;
+/** Upper bound on minAgeMinutes (1 year) so the cutoff can't overflow. */
+const MAX_AGE_MINUTES = 525_600;
+
+/** Parse a comma-separated enum list; undefined when absent. */
+function parseEnumList<T extends string>(value: unknown, allowed: readonly T[], name: string): T[] | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (typeof value !== "string") throw new AppError("VALIDATION_ERROR", `Invalid ${name}`);
+  const items = [...new Set(value.split(",").map((v) => v.trim()).filter(Boolean))];
+  const bad = items.filter((v) => !(allowed as readonly string[]).includes(v));
+  if (items.length === 0 || bad.length > 0) {
+    throw new AppError("VALIDATION_ERROR", `Invalid ${name}: expected one or more of ${allowed.join(", ")}`);
+  }
+  return items as T[];
+}
+
+function parseMinAgeMinutes(value: unknown): number {
+  if (value === undefined || value === "") return 0;
+  if (typeof value !== "string" || !/^\d+$/.test(value) || Number(value) > MAX_AGE_MINUTES) {
+    throw new AppError("VALIDATION_ERROR", `Invalid minAgeMinutes: expected an integer 0-${MAX_AGE_MINUTES}`);
+  }
+  return Number(value);
+}
+
+/**
+ * GET /admin/payments/exceptions
+ *
+ * Reconciliation view of payments that need recovery. Filters:
+ *   settlement     — comma list of pending|settled|failed
+ *   delivery       — comma list of delivered|undelivered
+ *   minAgeMinutes  — only rows paid at least this long ago (default 0)
+ *   limit          — 1-200 (default 50); oldest first so the most overdue
+ *                    rows are always inside the bound
+ * With neither settlement nor delivery given, the default exception set is
+ * "not settled OR undelivered". `summary` counts the *whole* matching set
+ * (not just the returned page) so operators can size the backlog.
+ */
+router.get("/admin/payments/exceptions", adminAuth, async (req, res) => {
+  const settlement = parseEnumList(req.query.settlement, SETTLEMENT_STATES, "settlement");
+  const delivery = parseEnumList(req.query.delivery, DELIVERY_STATES, "delivery");
+  const minAgeMinutes = parseMinAgeMinutes(req.query.minAgeMinutes);
+  const limit = Math.min(Math.max(Math.trunc(Number(req.query.limit)) || 50, 1), EXCEPTION_MAX_LIMIT);
+
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - minAgeMinutes * 60_000);
+
+  const conditions: SQL[] = [lte(payments.paidAt, cutoff)];
+  if (settlement) conditions.push(inArray(payments.status, settlement));
+  if (delivery) conditions.push(inArray(payments.deliveryStatus, delivery));
+  if (!settlement && !delivery) {
+    conditions.push(or(ne(payments.status, "settled"), eq(payments.deliveryStatus, "undelivered"))!);
+  }
+  const where = and(...conditions);
+
+  const [entries, [summaryRow]] = await Promise.all([
+    db
+      .select({
+        id: payments.id,
+        resourceId: payments.resourceId,
+        payer: payments.payerAddress,
+        recipient: payments.recipientAddress,
+        amount: payments.amount,
+        status: payments.status,
+        deliveryStatus: payments.deliveryStatus,
+        paidAt: payments.paidAt,
+      })
+      .from(payments)
+      .where(where)
+      .orderBy(asc(payments.paidAt), asc(payments.id))
+      .limit(limit),
+    db
+      .select({
+        total: sql<number>`count(*)::int`,
+        pending: sql<number>`count(*) filter (where ${payments.status} = 'pending')::int`,
+        settled: sql<number>`count(*) filter (where ${payments.status} = 'settled')::int`,
+        failed: sql<number>`count(*) filter (where ${payments.status} = 'failed')::int`,
+        delivered: sql<number>`count(*) filter (where ${payments.deliveryStatus} = 'delivered')::int`,
+        undelivered: sql<number>`count(*) filter (where ${payments.deliveryStatus} = 'undelivered')::int`,
+        under1h: sql<number>`count(*) filter (where ${payments.paidAt} > now() - interval '1 hour')::int`,
+        from1hTo24h: sql<number>`count(*) filter (where ${payments.paidAt} <= now() - interval '1 hour' and ${payments.paidAt} > now() - interval '24 hours')::int`,
+        from1dTo7d: sql<number>`count(*) filter (where ${payments.paidAt} <= now() - interval '24 hours' and ${payments.paidAt} > now() - interval '7 days')::int`,
+        over7d: sql<number>`count(*) filter (where ${payments.paidAt} <= now() - interval '7 days')::int`,
+        oldestPaidAt: sql<Date | string | null>`min(${payments.paidAt})`,
+      })
+      .from(payments)
+      .where(where),
+  ]);
+
+  const s = summaryRow ?? {
+    total: 0, pending: 0, settled: 0, failed: 0, delivered: 0, undelivered: 0,
+    under1h: 0, from1hTo24h: 0, from1dTo7d: 0, over7d: 0, oldestPaidAt: null,
+  };
+  const oldest = s.oldestPaidAt ? new Date(s.oldestPaidAt) : null;
+  const total = Number(s.total);
+
+  res.json({
+    filters: {
+      settlement: settlement ?? null,
+      delivery: delivery ?? null,
+      minAgeMinutes,
+      defaultExceptionSet: !settlement && !delivery,
+    },
+    limit,
+    truncated: total > entries.length,
+    entries: entries.map((e) => ({
+      ...e,
+      ageSeconds: Math.max(0, Math.floor((now.getTime() - new Date(e.paidAt).getTime()) / 1000)),
+    })),
+    summary: {
+      total,
+      bySettlement: { pending: Number(s.pending), settled: Number(s.settled), failed: Number(s.failed) },
+      byDelivery: { delivered: Number(s.delivered), undelivered: Number(s.undelivered) },
+      byAge: {
+        under1h: Number(s.under1h),
+        from1hTo24h: Number(s.from1hTo24h),
+        from1dTo7d: Number(s.from1dTo7d),
+        over7d: Number(s.over7d),
+      },
+      oldestPaidAt: oldest ? oldest.toISOString() : null,
+      oldestAgeSeconds: oldest ? Math.max(0, Math.floor((now.getTime() - oldest.getTime()) / 1000)) : null,
+    },
+    generatedAt: now.toISOString(),
+  });
 });
 
 export default router;

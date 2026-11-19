@@ -158,6 +158,33 @@ const envFlag = (defaultValue: boolean) =>
     .transform((v) => (v === undefined || v === "" ? defaultValue : v === "true" || v === "1" || v === "yes"));
 import { rootLogger } from "./lib/logger.js";
 
+/**
+ * Boot-time checks for the shared replay-protection policy. Returns warnings
+ * for configurations that silently weaken cross-replica replay guarantees.
+ */
+export function replayProtectionWarnings(input: {
+  NODE_ENV: string;
+  REQUIRE_REQUEST_SIGNATURE: boolean;
+  REDIS_URL?: string;
+  REPLAY_PROTECTION_FAILURE_MODE: "closed" | "open";
+}): string[] {
+  if (input.NODE_ENV !== "production" || !input.REQUIRE_REQUEST_SIGNATURE) return [];
+  if (!input.REDIS_URL) {
+    return [
+      "REDIS_URL is not set — request-signature replay protection is per-process and " +
+        "only holds for a single replica. Set REDIS_URL when running more than one instance.",
+    ];
+  }
+  if (input.REPLAY_PROTECTION_FAILURE_MODE === "open") {
+    return [
+      "REPLAY_PROTECTION_FAILURE_MODE=open — during a Redis outage signed mutations fall " +
+        "back to per-process replay checks, so a signature can be replayed against another " +
+        "replica. Use \"closed\" unless availability matters more than replay safety.",
+    ];
+  }
+  return [];
+}
+
 const envWithDefaults = applyNetworkEnvDefaults(process.env);
 
 export const envSchema = z.object({
@@ -258,6 +285,24 @@ export const envSchema = z.object({
 
   // Optional Redis URL for a shared sliding-window rate-limit store (multi-instance).
   REDIS_URL: z.string().url().optional(),
+  // Max time a signed mutation waits for the shared replay-cache Redis
+  // connection to become ready (cold start / reconnect) before the replay
+  // check gives up on Redis. Also the socket connect timeout.
+  REPLAY_REDIS_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(1).max(30_000).default(2_000),
+  // What signed mutations do when REDIS_URL is set but Redis cannot answer
+  // the replay check (outage, timeout, cold start past the bound):
+  //   closed — reject with 503; cross-replica replay guarantee always holds,
+  //            but signed mutations are unavailable during the outage.
+  //   open   — fall back to the per-process cache; mutations stay available
+  //            but a signature may be replayed once per other replica.
+  // Defaults to "closed" in production, "open" elsewhere.
+  REPLAY_PROTECTION_FAILURE_MODE: z
+    .enum(["closed", "open"])
+    .default(
+      typeof process !== "undefined" && (process.env.NODE_ENV ?? "development") === "production"
+        ? "closed"
+        : "open",
+    ),
 
   // Background workers (event listener + retry worker). When multiple replicas
   // run, only one should execute them: either set WORKERS_ENABLED=false on all
@@ -403,6 +448,12 @@ if (parsed.data.REQUIRE_REQUEST_SIGNATURE && !parsed.data.SIGNING_SECRET_KEY) {
     "[config] SIGNING_SECRET_KEY: required when REQUIRE_REQUEST_SIGNATURE=true (#42)",
   );
   process.exit(1);
+}
+
+// ── Replay-protection policy validation ──────────────────────────────────────
+for (const warning of replayProtectionWarnings(parsed.data)) {
+  rootLogger.warn({ event: "config_replay_protection", warning }, `[security] ${warning}`);
+  console.warn(`[config] WARNING: ${warning}`);
 }
 
 // ── Boot-time security warnings (#49) ────────────────────────────────────────

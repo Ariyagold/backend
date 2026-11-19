@@ -17,6 +17,7 @@ import {
   verifyRequestSignature,
 } from "../utils/requestSignature.js";
 import { rootLogger } from "../lib/logger.js";
+import { businessEventsTotal } from "../lib/metrics.js";
 
 declare global {
   namespace Express {
@@ -30,8 +31,10 @@ declare global {
 // ── Replay cache ─────────────────────────────────────────────────────────────
 //
 // #43: use Redis SET NX + TTL when REDIS_URL is set so replay protection works
-// across replicas. Fall back to an in-process Map when Redis is not configured,
-// but prune on a timer instead of on every request.
+// across replicas. Use an in-process Map when Redis is not configured (single
+// replica), pruned on a timer instead of on every request. When Redis is
+// configured but unavailable, REPLAY_PROTECTION_FAILURE_MODE decides between
+// rejecting (closed) and the local Map (open) — see onSharedReplayUnavailable.
 
 /** In-process fallback: signature → expiry timestamp (ms). */
 const inMemoryCache = new Map<string, number>();
@@ -45,36 +48,106 @@ let pruneTimer: NodeJS.Timeout | null = setInterval(() => {
 }, 60_000);
 pruneTimer.unref(); // don't keep the process alive
 
-type ReplayRedisClient = import("redis").RedisClientType;
+type RedisClient = import("redis").RedisClientType;
 
-/** Connected client, set once connect() resolves. */
-let redisClient: ReplayRedisClient | null = null;
-let redisConnectPromise: Promise<void> | null = null;
-/** Set by closeSignatureReplayStore(); stops new connections and reconnects. */
-let replayStoreClosed = false;
+let redisClient: RedisClient | null = null;
+let redisConnectPromise: Promise<RedisClient | null> | null = null;
 
-// Reconnection is lazy (triggered by the next replay check) and rate-limited
-// by a timestamp rather than a timer, so there is never pending reconnect work
-// to cancel. node-redis' own reconnect loop is disabled (its backoff timers
-// cannot be cancelled and a disconnect() racing an in-flight socket connect
-// leaks that socket).
-const RECONNECT_BASE_DELAY_MS = 500;
-const RECONNECT_MAX_DELAY_MS = 30_000;
-let reconnectAttempt = 0;
-let nextConnectAttemptAt = 0;
+/** Open one shared Redis connection; resolves null (and allows a retry) on failure. */
+function connectRedis(): Promise<RedisClient | null> {
+  return (async () => {
+    try {
+      const { createClient } = await import("redis");
+      const client = createClient({
+        url: config.REDIS_URL,
+        // Fail commands fast while disconnected instead of queueing them, so
+        // a replay check never silently waits on a dead connection.
+        disableOfflineQueue: true,
+        socket: {
+          connectTimeout: config.REPLAY_REDIS_CONNECT_TIMEOUT_MS,
+          reconnectStrategy: (retries: number) =>
+            retries >= 3 ? new Error("Redis unreachable") : 200 * (retries + 1),
+        },
+      }) as RedisClient;
+      client.on("error", () => {});
+      client.on("end", () => {
+        if (redisClient === client) {
+          redisClient = null;
+          redisConnectPromise = null;
+        }
+      });
+      await client.connect();
+      redisClient = client;
+      return client;
+    } catch (err) {
+      rootLogger.warn({ event: "replay_cache_redis_unavailable", err }, "Redis replay cache unavailable");
+      redisClient = null;
+      redisConnectPromise = null;
+      return null;
+    }
+  })();
+}
 
-function getRedisClient(): ReplayRedisClient | null {
-  if (!config.REDIS_URL || replayStoreClosed) return null;
+const TIMED_OUT = Symbol("timed-out");
+
+/** Resolve with `promise`, or with TIMED_OUT after `ms` (the underlying work continues). */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Return a ready shared Redis client, waiting (bounded by
+ * REPLAY_REDIS_CONNECT_TIMEOUT_MS) for the initial connection so cold-start
+ * requests use the shared store instead of per-process memory. Returns null
+ * when Redis is not configured, or not ready within the bound.
+ */
+async function getRedisClient(): Promise<RedisClient | null> {
+  if (!config.REDIS_URL) return null;
   if (redisClient?.isReady) return redisClient;
+
+  // A client that exhausted its reconnect budget is closed for good — drop
+  // it so the next call opens a fresh connection (recovery after an outage).
   if (redisClient && !redisClient.isOpen) {
-    // Connection dropped; forget it so the next check reconnects.
+    const stale = redisClient;
     redisClient = null;
     redisConnectPromise = null;
+    void stale.disconnect().catch(() => {});
   }
-  if (!redisConnectPromise && Date.now() >= nextConnectAttemptAt) {
-    redisConnectPromise = connectReplayRedis();
-  }
-  return null; // will be non-null after connect resolves
+
+  if (!redisConnectPromise) redisConnectPromise = connectRedis();
+  const client = await withTimeout(redisConnectPromise, config.REPLAY_REDIS_CONNECT_TIMEOUT_MS);
+  return client !== TIMED_OUT && client?.isReady ? client : null;
+}
+
+/** Shared replay store could not give a cross-replica answer (fail-closed). */
+class ReplayStoreUnavailableError extends Error {}
+
+/**
+ * Handle a request whose shared (Redis) replay check could not run.
+ *
+ * REPLAY_PROTECTION_FAILURE_MODE decides the tradeoff:
+ *   closed — reject the mutation (503). No signature can be accepted twice
+ *            across replicas, at the cost of signed mutations being
+ *            unavailable while Redis is down.
+ *   open   — fall back to this process's local cache. Mutations stay
+ *            available, but a signature replayed to a *different* replica
+ *            during the outage can be accepted again.
+ */
+function onSharedReplayUnavailable(reason: string, err?: unknown): void {
+  const closed = config.REPLAY_PROTECTION_FAILURE_MODE === "closed";
+  businessEventsTotal.inc({ event: "replay_check.degraded", outcome: closed ? "rejected" : "local_fallback" });
+  rootLogger.warn(
+    { event: "replay_cache_redis_degraded", reason, mode: config.REPLAY_PROTECTION_FAILURE_MODE, err },
+    closed
+      ? "shared replay check unavailable — rejecting signed mutation (fail-closed)"
+      : "shared replay check unavailable — falling back to in-process cache (fail-open)",
+  );
+  if (closed) throw new ReplayStoreUnavailableError(reason);
 }
 
 async function connectReplayRedis(): Promise<void> {
@@ -155,23 +228,34 @@ export async function closeSignatureReplayStore(): Promise<void> {
 /**
  * Check for a replayed signature, and mark it as seen.
  * Returns true when the signature has already been used (replay).
+ * Throws ReplayStoreUnavailableError when shared mode is configured, Redis
+ * cannot answer, and the policy is fail-closed.
  */
 async function checkAndMarkReplay(signature: string, ttlMs: number): Promise<boolean> {
-  const redis = getRedisClient();
-  if (redis) {
-    // SET NX with TTL — atomic; works across replicas (#43).
-    const key = `replay:${signature}`;
-    const ttlSeconds = Math.ceil(ttlMs / 1000);
-    try {
-      const set = await redis.set(key, "1", { NX: true, EX: ttlSeconds });
-      // set === null means key already existed → replay
-      return set === null;
-    } catch (err) {
-      rootLogger.warn({ event: "replay_cache_redis_error", err }, "Redis replay check failed — falling back to in-process cache");
+  if (config.REDIS_URL) {
+    const redis = await getRedisClient();
+    if (!redis) {
+      onSharedReplayUnavailable("redis_not_ready");
+    } else {
+      // SET NX with TTL — atomic; works across replicas (#43).
+      const key = `replay:${signature}`;
+      const ttlSeconds = Math.ceil(ttlMs / 1000);
+      try {
+        const set = await withTimeout(
+          redis.set(key, "1", { NX: true, EX: ttlSeconds }),
+          config.REPLAY_REDIS_CONNECT_TIMEOUT_MS,
+        );
+        if (set === TIMED_OUT) throw new Error("Redis replay check timed out");
+        // set === null means key already existed → replay
+        return set === null;
+      } catch (err) {
+        onSharedReplayUnavailable("redis_command_failed", err);
+      }
     }
   }
 
-  // In-process fallback.
+  // In-process store: the only store when REDIS_URL is unset, or the
+  // fail-open fallback.
   const now = Date.now();
   if (inMemoryCache.has(signature)) return true;
   inMemoryCache.set(signature, now + ttlMs);
@@ -324,7 +408,14 @@ export async function requestSignatureAuth(req: Request, res: Response, next: Ne
       fail("Request signature already used");
       return;
     }
-  } catch {
+  } catch (err) {
+    if (err instanceof ReplayStoreUnavailableError) {
+      next(new AppError(
+        "SERVICE_UNAVAILABLE",
+        "Replay protection is temporarily unavailable; retry the request shortly",
+      ));
+      return;
+    }
     fail("Replay check failed");
     return;
   }
@@ -332,9 +423,13 @@ export async function requestSignatureAuth(req: Request, res: Response, next: Ne
   next();
 }
 
-/** Test helper — forget previously accepted signatures (in-process cache only). */
+/** Test helper — forget previously accepted signatures and drop the Redis client. */
 export function __resetSignatureReplayCache(): void {
   inMemoryCache.clear();
+  const client = redisClient;
+  redisClient = null;
+  redisConnectPromise = null;
+  if (client) void client.disconnect().catch(() => {});
 }
 
 /** Test helper — trigger the Redis connection and report replay-store state. */
