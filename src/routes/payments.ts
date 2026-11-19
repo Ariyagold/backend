@@ -5,6 +5,7 @@ import { db } from "../db/client.js";
 import { payments, publishers } from "../db/schema.js";
 import { AppError } from "../lib/errors.js";
 import { hashApiKey } from "../utils/crypto.js";
+import { noStore } from "../middleware/security.js";
 import {
   buildWalletAuthMessageV1,
   buildWalletAuthMessageV2,
@@ -55,8 +56,11 @@ async function findPublisherForApiKey(key: string) {
     .then((rows) => rows[0] ?? null);
 }
 
+// Private financial responses are never cached by browsers or shared proxies
+// (see noStore in middleware/security.ts).
+
 // GET /payments/:id/receipt — payment receipt endpoint
-router.get("/payments/:id/receipt", async (req, res) => {
+router.get("/payments/:id/receipt", noStore, async (req, res) => {
   const walletAddressHeader = req.headers["x-wallet-address"];
   const walletAddress = typeof walletAddressHeader === "string" ? walletAddressHeader : undefined;
   const walletAuthorized = walletAddress !== undefined && verifyWalletSignature(req, walletAddress);
@@ -95,7 +99,7 @@ router.get("/payments/:id/receipt", async (req, res) => {
 });
 
 // GET /buyers/:address/payments — buyer payment history
-router.get("/buyers/:address/payments", async (req, res) => {
+router.get("/buyers/:address/payments", noStore, async (req, res) => {
   const address = req.params.address as string;
   if (!verifyWalletSignature(req, address)) {
     throw new AppError("UNAUTHORIZED", "Valid wallet signature required");

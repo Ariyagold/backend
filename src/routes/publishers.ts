@@ -3,6 +3,7 @@ import type { z } from "zod/v4";
 import { AppError } from "../lib/errors.js";
 import { apiKeyAuth } from "../middleware/apiKeyAuth.js";
 import { requestSignatureAuth } from "../middleware/requestSignatureAuth.js";
+import { noStore } from "../middleware/security.js";
 import { publisherRateLimit, registerIpRateLimit } from "../middleware/rateLimiters.js";
 import { validate } from "../middleware/validate.js";
 import {
@@ -24,7 +25,7 @@ const router: RouterType = Router();
 type UpdateWebhookConfig = z.infer<typeof updateWebhookConfigSchema>;
 
 // POST /publishers — register a new publisher (public)
-router.post("/publishers", registerIpRateLimit, validate(publisherRegisterSchema), async (req, res) => {
+router.post("/publishers", noStore, registerIpRateLimit, validate(publisherRegisterSchema), async (req, res) => {
   try {
     const { publisher, apiKey, signingSecret } = await registerPublisher(req.body);
     res.status(201).json({
@@ -86,7 +87,7 @@ router.get("/publishers/me/resources", apiKeyAuth, async (req, res) => {
 
 // POST /publishers/me/api-keys/rotate — issue a new key, invalidate the old one (#40)
 // The new key is returned once in plaintext; the old key is immediately invalid.
-router.post("/publishers/me/api-keys/rotate", apiKeyAuth, publisherRateLimit, async (req, res) => {
+router.post("/publishers/me/api-keys/rotate", noStore, apiKeyAuth, publisherRateLimit, async (req, res) => {
   const newApiKey = await rotateApiKey(req.publisher!.id);
   res.json({
     apiKey: newApiKey, // shown once — store it securely
@@ -97,7 +98,7 @@ router.post("/publishers/me/api-keys/rotate", apiKeyAuth, publisherRateLimit, as
 // POST /publishers/me/signing-secret/rotate — issue a new HMAC signing secret (#42)
 // The new secret is returned once in plaintext; all existing request signatures
 // signed with the old secret are immediately invalid.
-router.post("/publishers/me/signing-secret/rotate", apiKeyAuth, publisherRateLimit, async (req, res) => {
+router.post("/publishers/me/signing-secret/rotate", noStore, apiKeyAuth, publisherRateLimit, async (req, res) => {
   const newSigningSecret = await rotateSigningSecret(req.publisher!.id);
   res.json({
     signingSecret: newSigningSecret, // shown once — store it securely, use as HMAC secret

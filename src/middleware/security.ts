@@ -56,3 +56,20 @@ export function securityHeaders(): RequestHandler {
     return (isDocs ? relaxed : strict)(req, res, next);
   };
 }
+
+/**
+ * No-store cache policy for responses carrying credentials or private
+ * financial data (publisher API keys / signing secrets, wallet-authorized
+ * payment history and receipts).
+ *
+ * `Cache-Control: no-store` forbids browsers and shared proxies/CDNs from
+ * storing the response at all (not even revalidated copies). `Pragma` and
+ * `Expires` cover legacy HTTP/1.0 caches. Mount this *before* authentication
+ * and validation so error responses (401/403/404/429/…) carry it too.
+ */
+export const noStore: RequestHandler = (_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  next();
+};
