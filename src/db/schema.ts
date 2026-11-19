@@ -27,6 +27,8 @@ export const verificationStatusEnum = pgEnum("verification_status", [
   "verified",
   "rejected",
   "skipped",
+  // Held for a human admin decision (low confidence / injection hold) (#188).
+  "review_required",
 ]);
 
 export const onchainStatusEnum = pgEnum("onchain_status_enum", [
@@ -65,6 +67,8 @@ export const publishers = pgTable(
     rateLimitRpm: integer("rate_limit_rpm"),
     // Webhook delivery configuration. Nullable so publishers can opt in later.
     webhookUrl: text("webhook_url"),
+    // Encrypted with WEBHOOK_ENCRYPTION_KEY as `v1:<keyId>:<base64>` (legacy
+    // rows may be un-prefixed ciphertext or plaintext) — see src/utils/crypto.ts.
     webhookSecret: text("webhook_secret"),
     // Subscribed WebhookEvent values; null/empty means all events.
     webhookEvents: text("webhook_events").array(),
@@ -72,6 +76,7 @@ export const publishers = pgTable(
     // Per-publisher HMAC signing secret (shown once on creation/rotation, stored
     // encrypted). Used by requestSignatureAuth (#42) instead of the raw API key
     // so possession of the key alone is insufficient to forge a valid signature.
+    // Stored as `v1:<keyId>:<base64>` so keys rotate without an atomic rewrite.
     signingSecret: text("signing_secret"),
     // Set when the publisher rotates their API key. Any key whose hash matches
     // a row with a non-null api_key_revoked_at is rejected by apiKeyAuth (#40).
@@ -179,11 +184,16 @@ export const pendingCleanup = pgTable(
     storagePath: text("storage_path").notNull(),
     resourceId: text("resource_id").references(() => resources.id),
     attempts: integer("attempts").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).defaultNow().notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
-    // The cleanup worker drains the queue oldest-first.
+    // The cleanup worker polls the earliest due jobs first.
     createdAtIdx: index("idx_pending_cleanup_created_at").on(table.createdAt),
+    nextAttemptAtIdx: index("idx_pending_cleanup_next_attempt").on(
+      table.nextAttemptAt,
+      table.createdAt,
+    ),
     attemptsNonNegative: check("pending_cleanup_attempts_nonneg", sql`${table.attempts} >= 0`),
   }),
 );
@@ -207,6 +217,8 @@ export const verifications = pgTable(
     completionTokens: integer("completion_tokens"),
     totalTokens: integer("total_tokens"),
     estimatedCost: text("estimated_cost"), // USD, stringified for precision
+    // Review-input contract the verdict was produced under (#189); null on legacy rows.
+    inputContractVersion: text("input_contract_version"),
     checkedAt: timestamp("checked_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
@@ -252,14 +264,38 @@ export const payments = pgTable(
     // agent earnings are summed from these rows (#99).
     verificationId: text("verification_id").references(() => verifications.id),
     // Delivery state of the purchased content: "delivered" once the file was
-    // served, "undelivered" when the download failed after payment (#86).
+    // served, "undelivered" when the download failed after payment (#86),
+    // "pending" while streaming, "aborted" if the response closed early (#194).
     deliveryStatus: text("delivery_status").notNull().default("delivered"),
     // Settlement state of the payment. Only settled payments count toward
     // earnings (#99).
     status: paymentStatusEnum("status").notNull().default("pending"),
+    // Purchase snapshot — what was bought and on what terms, frozen at
+    // purchase time so receipts survive later resource edits. NULL
+    // receipt_version marks a legacy row recorded before snapshots existed;
+    // those are never back-filled (see src/lib/purchaseSnapshot.ts).
+    receiptVersion: integer("receipt_version"),
+    network: text("network"),
+    asset: text("asset"),
+    resourceTitle: text("resource_title"),
+    resourceType: text("resource_type"),
+    resourceContentHash: text("resource_content_hash"),
     paidAt: timestamp("paid_at", { withTimezone: true }).defaultNow().notNull(),
+    // Stable settlement identity: sha256 of the x402 payment authorization
+    // header (covers v1/v2 payloads). Unique so replays/retries can't count
+    // one settlement twice (#192). Null for legacy rows.
+    settlementKey: text("settlement_key"),
+    // Chain transaction / facilitator reference of the settlement (#190).
+    settlementTxHash: text("settlement_tx_hash"),
+    settlementNetwork: text("settlement_network"),
+    // Failure classification only; never payment authorization material (#190).
+    settlementFailureReason: text("settlement_failure_reason"),
+    settledAt: timestamp("settled_at", { withTimezone: true }),
   },
   (table) => ({
+    settlementKeyUnique: uniqueIndex("uq_payments_settlement_key").on(table.settlementKey),
+    // Reconciliation scans pending rows by age (#191).
+    pendingIdx: index("idx_payments_pending_paid_at").on(table.paidAt).where(sql`${table.status} = 'pending'`),
     // Payment history is queried per payer wallet (#285).
     payerAddressIdx: index("idx_payments_payer_address").on(table.payerAddress),
     // Publisher analytics aggregate per resource (#100), and analytics and
@@ -267,6 +303,13 @@ export const payments = pgTable(
     resourceIdIdx: index("idx_payments_resource_id").on(table.resourceId),
     // Agent-status earnings sum per recipient (#99).
     recipientAddressIdx: index("idx_payments_recipient_address").on(table.recipientAddress),
+    // Admin reconciliation filters exceptions by settlement / delivery state
+    // and orders oldest-first.
+    statusPaidAtIdx: index("idx_payments_status_paid_at").on(table.status, table.paidAt),
+    deliveryStatusPaidAtIdx: index("idx_payments_delivery_status_paid_at").on(
+      table.deliveryStatus,
+      table.paidAt,
+    ),
   }),
 );
 
@@ -332,11 +375,17 @@ export const moderationEvents = pgTable(
 );
 
 // Idempotency records shared across replicas (#71).
-export const idempotencyRecords = pgTable("idempotency_records", {
-  key: text("key").primaryKey(),
-  record: jsonb("record").notNull(),
-  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
-});
+export const idempotencyRecords = pgTable(
+  "idempotency_records",
+  {
+    key: text("key").primaryKey(),
+    record: jsonb("record").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  },
+  (table) => ({
+    expiresAtIdx: index("idx_idempotency_records_expires_at").on(table.expiresAt),
+  }),
+);
 
 // Webhook outbox — persists pending deliveries so they survive restarts (#48).
 // A background worker picks them up and retries with exponential backoff.
@@ -370,5 +419,7 @@ export const webhookOutbox = pgTable(
     publisherIdIdx: index("idx_webhook_outbox_publisher_id").on(table.publisherId, table.createdAt),
     // Retention cleanup queries terminal rows by status and delivered_at (#157).
     statusDeliveredIdx: index("idx_webhook_outbox_status_delivered").on(table.status, table.deliveredAt),
+    attemptsNonNegative: check("webhook_outbox_attempts_nonneg", sql`${table.attempts} >= 0`),
+    maxAttemptsPositive: check("webhook_outbox_max_attempts_positive", sql`${table.maxAttempts} > 0`),
   }),
 );

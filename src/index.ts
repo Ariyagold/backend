@@ -11,10 +11,12 @@ import { rootLogger } from "./lib/logger.js";
 import { beginShutdown, whenDrained, inFlightCount } from "./lib/lifecycle.js";
 import { pgClient } from "./db/client.js";
 import { startPoolMetrics, stopPoolMetrics } from "./db/client.js";
+import { startPaymentReconciliationWorker, stopPaymentReconciliationWorker } from "./workers/paymentReconciliationWorker.js";
 import { startRetryPendingWorker, stopRetryPendingWorker } from "./workers/retryPendingWorker.js";
 import { startEventListener, stopEventListener } from "./workers/eventListener.js";
 import { startWebhookOutboxWorker, stopWebhookOutboxWorker } from "./workers/webhookOutboxWorker.js";
 import { closeRateLimitStore } from "./lib/rateLimit/index.js";
+import { closeSignatureReplayStore } from "./middleware/requestSignatureAuth.js";
 // Advisory lock key used to elect a single leader across replicas. Only the
 // instance holding this lock runs the background workers, so scaling out does
 // not duplicate RPC load or let replicas write the same rows concurrently.
@@ -73,6 +75,7 @@ function startWorkers(): void {
   workersStarted = true;
   rootLogger.info({ event: "workers_started_as_leader" }, "acquired worker leader lock; starting background workers");
   startRetryPendingWorker();
+  startPaymentReconciliationWorker();
   startEventListener();
   startWebhookOutboxWorker();
   startLeaderHealthCheck();
@@ -82,6 +85,7 @@ function stopWorkers(): void {
   if (!workersStarted) return;
   workersStarted = false;
   stopRetryPendingWorker();
+  stopPaymentReconciliationWorker();
   stopEventListener();
   stopWebhookOutboxWorker();
   rootLogger.info({ event: "workers_stopped" }, "background workers stopped");
@@ -229,6 +233,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
   try {
     await closeRateLimitStore();
+    await closeSignatureReplayStore();
     await releaseWorkerLeaderLock();
     await pgClient.end({ timeout: 5 });
     const forced = timedOut && inFlightCount() > 0;

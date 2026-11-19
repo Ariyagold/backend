@@ -2,22 +2,26 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import express from "express";
 import request from "supertest";
 
-const { state, mockDeliver } = vi.hoisted(() => ({
+const { state, mockDeliver, mockConfig } = vi.hoisted(() => ({
   state: {
     publisher: null as Record<string, unknown> | null,
     lastSet: null as Record<string, unknown> | null,
   },
   mockDeliver: vi.fn(),
+  mockConfig: {
+    WEBHOOK_ENCRYPTION_KEY: undefined as string | undefined,
+    WEBHOOK_SECRET_ENCRYPTION_REQUIRED: false,
+  },
 }));
 
 vi.mock("../config.js", () => ({
-  config: {
+  config: Object.assign(mockConfig, {
     NODE_ENV: "production",
     BASE_URL: "http://localhost:4021",
     PUBLISHER_RATE_LIMIT_RPM_DEFAULT: 60,
     PUBLISHER_RATE_LIMIT_MAX_RPM: 1000,
     PUBLISHER_RATE_LIMIT_WINDOW_MS: 60_000,
-  },
+  }),
 }));
 
 vi.mock("../db/schema.js", () => ({
@@ -58,7 +62,9 @@ vi.mock("../middleware/rateLimiters.js", () => ({
   registerIpRateLimit: (_req: any, _res: any, next: any) => next(),
 }));
 
-vi.mock("../services/publisherService.js", () => ({
+vi.mock("../services/publisherService.js", async (importOriginal) => ({
+  encodeWebhookSecretForStorage: (await importOriginal<typeof import("../services/publisherService.js")>())
+    .encodeWebhookSecretForStorage,
   registerPublisher: vi.fn(),
   getPublisherResources: vi.fn(),
 }));
@@ -69,6 +75,7 @@ vi.mock("../services/webhookService.js", async (importOriginal) => ({
 }));
 
 import publisherRouter from "./publishers.js";
+import { decryptWebhookSecret, isEnvelope } from "../utils/crypto.js";
 import { errorHandler } from "../middleware/errorHandler.js";
 
 const app = express().use(express.json()).use(publisherRouter).use(errorHandler);
@@ -235,5 +242,72 @@ describe("publisher webhook routes", () => {
     const res = await request(app).post("/publishers/me/webhooks/test");
     expect(res.status).toBe(502);
     expect(res.body.delivered).toBe(false);
+  });
+});
+
+describe("webhook secret encryption enforcement", () => {
+  const KEY = "webhook-encryption-key-0123456789";
+  const SECRET = "whsec_super_secret_value_1234";
+
+  beforeEach(() => {
+    state.publisher = basePublisher({ webhookUrl: "https://hooks.example.com/a" });
+    state.lastSet = null;
+    mockDeliver.mockReset();
+    mockConfig.WEBHOOK_ENCRYPTION_KEY = undefined;
+    mockConfig.WEBHOOK_SECRET_ENCRYPTION_REQUIRED = false;
+  });
+
+  it("stores the secret encrypted when a key is configured", async () => {
+    mockConfig.WEBHOOK_ENCRYPTION_KEY = KEY;
+    mockConfig.WEBHOOK_SECRET_ENCRYPTION_REQUIRED = true;
+    const res = await request(app).patch("/publishers/me/webhooks").send({ webhookSecret: SECRET });
+    expect(res.status).toBe(200);
+    const stored = state.lastSet!.webhookSecret as string;
+    expect(stored).not.toBe(SECRET);
+    expect(isEnvelope(stored)).toBe(true);
+    expect(decryptWebhookSecret(stored, KEY)).toBe(SECRET);
+    expect(JSON.stringify(res.body)).not.toContain(SECRET);
+  });
+
+  it("rejects secret writes when encryption is required but no key is configured", async () => {
+    mockConfig.WEBHOOK_SECRET_ENCRYPTION_REQUIRED = true;
+    const res = await request(app)
+      .patch("/publishers/me/webhooks")
+      .send({ webhookUrl: "https://hooks.example.com/b", webhookSecret: SECRET, webhookEnabled: true });
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe("SERVICE_UNAVAILABLE");
+    expect(JSON.stringify(res.body)).not.toContain(SECRET);
+    // Nothing (URL included) is persisted when the secret is rejected.
+    expect(state.lastSet).toBeNull();
+  });
+
+  it("still allows changes that store no secret while enforcement blocks secrets", async () => {
+    mockConfig.WEBHOOK_SECRET_ENCRYPTION_REQUIRED = true;
+
+    const disable = await request(app).patch("/publishers/me/webhooks").send({ webhookEnabled: false });
+    expect(disable.status).toBe(200);
+    expect(state.lastSet).toEqual({ webhookEnabled: false });
+
+    const clear = await request(app).patch("/publishers/me/webhooks").send({ webhookSecret: null });
+    expect(clear.status).toBe(200);
+    expect(state.lastSet).toEqual({ webhookSecret: null });
+
+    const enable = await request(app).patch("/publishers/me/webhooks").send({ webhookEnabled: true });
+    expect(enable.status).toBe(200);
+  });
+
+  it("keeps sending test events for an existing plaintext secret under enforcement", async () => {
+    mockConfig.WEBHOOK_SECRET_ENCRYPTION_REQUIRED = true;
+    state.publisher = basePublisher({ webhookUrl: "https://hooks.example.com/a", webhookSecret: SECRET });
+    mockDeliver.mockResolvedValue({ delivered: true, attempts: 1 });
+    const res = await request(app).post("/publishers/me/webhooks/test");
+    expect(res.status).toBe(200);
+    expect(mockDeliver.mock.calls[0]![0]).toMatchObject({ secret: SECRET });
+  });
+
+  it("stores plaintext when enforcement is off and no key is configured (dev)", async () => {
+    const res = await request(app).patch("/publishers/me/webhooks").send({ webhookSecret: SECRET });
+    expect(res.status).toBe(200);
+    expect(state.lastSet!.webhookSecret).toBe(SECRET);
   });
 });
