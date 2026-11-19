@@ -21,9 +21,26 @@ const NETWORK_PRESETS = {
   },
 } as const;
 
+// Recognized STELLAR_NETWORK aliases. Any other nonempty value is rejected at
+// boot so a misspelled value (e.g. "tsetnet") can't silently select testnet (#210).
+const STELLAR_NETWORK_ALIASES: Record<string, StellarDeploymentNetwork> = {
+  testnet: "testnet",
+  mainnet: "mainnet",
+  pubnet: "mainnet",
+  public: "mainnet",
+};
+
 function resolveStellarNetwork(value: string | undefined): StellarDeploymentNetwork {
-  const v = (value ?? "testnet").trim().toLowerCase();
-  return v === "mainnet" || v === "pubnet" || v === "public" ? "mainnet" : "testnet";
+  // Missing/empty values keep the documented default (testnet).
+  if (value === undefined) return "testnet";
+  const v = value.trim().toLowerCase();
+  if (v === "") return "testnet";
+  const resolved = STELLAR_NETWORK_ALIASES[v];
+  if (resolved) return resolved;
+  throw new Error(
+    `STELLAR_NETWORK="${value}" is not a recognized Stellar network. ` +
+      `Use one of: testnet, mainnet, pubnet, public.`,
+  );
 }
 
 function cleanEnvValue(value: string): string {
@@ -74,6 +91,20 @@ function applyNetworkEnvDefaults(rawEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   }
   const network = resolveStellarNetwork(env.STELLAR_NETWORK);
   const preset = NETWORK_PRESETS[network];
+
+  // REGISTRY_CONTRACT_ID and VAULT_REGISTRY_CONTRACT_ID are aliases for the same
+  // contract. When both are set they must agree, otherwise components reading
+  // different names could be pointed at different registries (#213).
+  const registryId = env.REGISTRY_CONTRACT_ID;
+  const vaultRegistryId = env.VAULT_REGISTRY_CONTRACT_ID;
+  if (registryId && vaultRegistryId && registryId !== vaultRegistryId) {
+    throw new Error(
+      `REGISTRY_CONTRACT_ID and VAULT_REGISTRY_CONTRACT_ID are both set but differ ` +
+        `(${registryId} vs ${vaultRegistryId}). These are aliases for the same ` +
+        `vault-registry contract; set only one or use the same value.`,
+    );
+  }
+
   return {
     ...env,
     STELLAR_NETWORK: network,
@@ -185,11 +216,22 @@ export function replayProtectionWarnings(input: {
   return [];
 }
 
-const envWithDefaults = applyNetworkEnvDefaults(process.env);
+let envWithDefaults: NodeJS.ProcessEnv;
+try {
+  envWithDefaults = applyNetworkEnvDefaults(process.env);
+} catch (err) {
+  // Pre-schema validation errors (e.g. an unrecognized STELLAR_NETWORK alias
+  // or conflicting registry contract aliases). Surface them with the same
+  // `[config] <name>: ...` format as schema failures and stop the boot (#210, #213).
+  const message = err instanceof Error ? err.message : String(err);
+  rootLogger.error({ event: "config_invalid", error: message }, "invalid environment variables");
+  console.error(`[config] ${message}`);
+  process.exit(1);
+}
 
 export const envSchema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
-  PORT: z.coerce.number().default(4021),
+  PORT: z.coerce.number().int().min(1).max(65535).default(4021),
   TRUST_PROXY: z.coerce.number().int().nonnegative().optional(),
   BASE_URL: z.string().default("http://localhost:4021"),
   WEB_APP_URL: z.string().url().or(z.literal("")).default("http://localhost:5173"),
@@ -198,10 +240,10 @@ export const envSchema = z.object({
   // Stellar / x402 — STELLAR_NETWORK selects preset defaults; individual vars may override.
   STELLAR_NETWORK: z.enum(["testnet", "mainnet"]).default("testnet"),
   NETWORK: z.string().min(1),
-  FACILITATOR_URL: z.string().default("https://www.x402.org/facilitator"),
+  FACILITATOR_URL: httpUrl("FACILITATOR_URL").default("https://www.x402.org/facilitator"),
   PAY_TO: stellarAccount("PAY_TO (platform wallet address)"),
   AGENT_SECRET_KEY: stellarSecret("AGENT_SECRET_KEY (platform agent secret)"),
-  USDC_CONTRACT_ID: z.string().min(1),
+  USDC_CONTRACT_ID: stellarContract("USDC_CONTRACT_ID"),
 
   // Soroban / vault-registry
   SOROBAN_RPC_URL: z.string().min(1, "SOROBAN_RPC_URL is required"),
@@ -223,9 +265,9 @@ export const envSchema = z.object({
   SUPABASE_STORAGE_BUCKET: z.string().default("resources"),
 
   // Limits
-  MAX_FILE_SIZE_MB: z.coerce.number().default(50),
+  MAX_FILE_SIZE_MB: z.coerce.number().int().min(1).max(10240).default(50),
   // Max multipart uploads processed at once; excess requests get 503 (#90).
-  MAX_CONCURRENT_UPLOADS: z.coerce.number().int().min(1).default(4),
+  MAX_CONCURRENT_UPLOADS: z.coerce.number().int().min(1).max(1000).default(4),
   // Explicit JSON body limit for express.json() (e.g. "1mb", "512kb").
   MAX_JSON_BODY_SIZE: z.string().default("1mb"),
   // Comma-separated allowlist of accepted upload content types (#87).
@@ -249,47 +291,48 @@ export const envSchema = z.object({
   // Verification
   VERIFICATION_PRICE: z.string().default("0.10"),
   // Hard deadline for the verification model call, in ms (#184).
-  VERIFICATION_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+  VERIFICATION_TIMEOUT_MS: z.coerce.number().int().min(1).max(600000).default(30000),
   // OpenRouter token pricing (USD per 1M tokens) used to estimate the cost of
   // each verification (#283). Defaults track anthropic/claude-sonnet-4 list
   // pricing; override per model if you change OPENROUTER_MODEL.
-  VERIFICATION_PROMPT_COST_PER_1M: z.coerce.number().nonnegative().default(3),
-  VERIFICATION_COMPLETION_COST_PER_1M: z.coerce.number().nonnegative().default(15),
+  VERIFICATION_PROMPT_COST_PER_1M: z.coerce.number().nonnegative().max(1_000_000).default(3),
+  VERIFICATION_COMPLETION_COST_PER_1M: z.coerce.number().nonnegative().max(1_000_000).default(15),
   // Daily budget (USD) for paid verification spend across all publishers (#186).
   // Spend is reserved before the model call and settled afterwards; requests
   // that would push the day's reserved + consumed spend over this limit are
   // rejected with 429 before any provider cost is incurred. Set to 0 to
   // disable paid verification entirely.
-  VERIFICATION_DAILY_SPEND_LIMIT_USD: z.coerce.number().nonnegative().default(50),
+  VERIFICATION_DAILY_SPEND_LIMIT_USD: z.coerce.number().nonnegative().max(1_000_000).default(50),
 
-  // Rate limiting (verify-content + publish)
-  RATE_LIMIT_REGISTER_IP_MAX: z.coerce.number().default(10),
-  RATE_LIMIT_REGISTER_IP_WINDOW_MS: z.coerce.number().default(3_600_000),
-  RATE_LIMIT_VERIFY_IP_MAX: z.coerce.number().default(10),
-  RATE_LIMIT_VERIFY_IP_WINDOW_MS: z.coerce.number().default(60_000),
-  RATE_LIMIT_VERIFY_WALLET_MAX: z.coerce.number().default(5),
-  RATE_LIMIT_VERIFY_WALLET_WINDOW_MS: z.coerce.number().default(3_600_000),
-  RATE_LIMIT_PUBLISH_IP_MAX: z.coerce.number().default(20),
-  RATE_LIMIT_PUBLISH_IP_WINDOW_MS: z.coerce.number().default(60_000),
-  RATE_LIMIT_PUBLISH_WALLET_MAX: z.coerce.number().default(10),
-  RATE_LIMIT_PUBLISH_WALLET_WINDOW_MS: z.coerce.number().default(3_600_000),
+  // Rate limiting (verify-content + publish). Counts are positive integers;
+  // windows are positive integer milliseconds up to 24h.
+  RATE_LIMIT_REGISTER_IP_MAX: z.coerce.number().int().min(1).max(1_000_000).default(10),
+  RATE_LIMIT_REGISTER_IP_WINDOW_MS: z.coerce.number().int().min(1).max(86_400_000).default(3_600_000),
+  RATE_LIMIT_VERIFY_IP_MAX: z.coerce.number().int().min(1).max(1_000_000).default(10),
+  RATE_LIMIT_VERIFY_IP_WINDOW_MS: z.coerce.number().int().min(1).max(86_400_000).default(60_000),
+  RATE_LIMIT_VERIFY_WALLET_MAX: z.coerce.number().int().min(1).max(1_000_000).default(5),
+  RATE_LIMIT_VERIFY_WALLET_WINDOW_MS: z.coerce.number().int().min(1).max(86_400_000).default(3_600_000),
+  RATE_LIMIT_PUBLISH_IP_MAX: z.coerce.number().int().min(1).max(1_000_000).default(20),
+  RATE_LIMIT_PUBLISH_IP_WINDOW_MS: z.coerce.number().int().min(1).max(86_400_000).default(60_000),
+  RATE_LIMIT_PUBLISH_WALLET_MAX: z.coerce.number().int().min(1).max(1_000_000).default(10),
+  RATE_LIMIT_PUBLISH_WALLET_WINDOW_MS: z.coerce.number().int().min(1).max(86_400_000).default(3_600_000),
 
   // Publisher rate limiting defaults (per publisher, requests per minute).
-  PUBLISHER_RATE_LIMIT_RPM_DEFAULT: z.coerce.number().default(60),
-  PUBLISHER_RATE_LIMIT_WINDOW_MS: z.coerce.number().default(60_000),
-  PUBLISHER_RATE_LIMIT_MAX_RPM: z.coerce.number().default(10_000),
+  PUBLISHER_RATE_LIMIT_RPM_DEFAULT: z.coerce.number().int().min(1).max(1_000_000).default(60),
+  PUBLISHER_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().min(1).max(86_400_000).default(60_000),
+  PUBLISHER_RATE_LIMIT_MAX_RPM: z.coerce.number().int().min(1).max(1_000_000).default(10_000),
 
   // Webhook delivery
-  WEBHOOK_TIMEOUT_MS: z.coerce.number().default(10_000),
-  WEBHOOK_MAX_ATTEMPTS: z.coerce.number().default(3),
-  // Configurable retention policy for terminal outbox rows (#157)
-  WEBHOOK_OUTBOX_RETENTION_DAYS: z.coerce.number().default(7),
-  WEBHOOK_OUTBOX_CLEANUP_BATCH_SIZE: z.coerce.number().int().min(1).default(100),
+  WEBHOOK_TIMEOUT_MS: z.coerce.number().int().min(1).max(300000).default(10_000),
+  WEBHOOK_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(3),
+  // Configurable retention policy for terminal outbox rows (#157). 0 keeps rows indefinitely.
+  WEBHOOK_OUTBOX_RETENTION_DAYS: z.coerce.number().int().min(0).max(3650).default(7),
+  WEBHOOK_OUTBOX_CLEANUP_BATCH_SIZE: z.coerce.number().int().min(1).max(10000).default(100),
 
   // Retry worker (#85): max items processed per tick and per-item timeout so a
   // slow RPC can't make a tick run into the next one.
-  RETRY_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).default(25),
-  RETRY_WORKER_ITEM_TIMEOUT_MS: z.coerce.number().int().min(1).default(30_000),
+  RETRY_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(10000).default(25),
+  RETRY_WORKER_ITEM_TIMEOUT_MS: z.coerce.number().int().min(1).max(600000).default(30_000),
 
   // Optional Redis URL for a shared sliding-window rate-limit store (multi-instance).
   REDIS_URL: z.string().url().optional(),
@@ -358,28 +401,29 @@ export const envSchema = z.object({
   // on the creator's behalf (#80). Off by default; clients must send signedXdr.
   ALLOW_LEGACY_REGISTER: envFlag(false),
   // Max clock skew for X-Timestamp when signatures are required (default 5 minutes).
-  SIGNATURE_MAX_SKEW_MS: z.coerce.number().default(300_000),
+  SIGNATURE_MAX_SKEW_MS: z.coerce.number().int().min(1).max(3_600_000).default(300_000),
 
   // Per-request timeout — slow upstreams (RPC, facilitator) return 503 instead
   // of hanging the connection.
-  REQUEST_TIMEOUT_MS: z.coerce.number().default(30_000),
+  REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1).max(600000).default(30_000),
   // Max time to drain in-flight requests on SIGTERM/SIGINT before forcing exit.
-  GRACEFUL_SHUTDOWN_TIMEOUT_MS: z.coerce.number().default(10_000),
+  // 0 skips the drain and exits immediately.
+  GRACEFUL_SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(0).max(300000).default(10_000),
   // How long a publish Idempotency-Key is remembered so retries return the
   // original result instead of creating a duplicate (default 24h).
-  IDEMPOTENCY_TTL_MS: z.coerce.number().default(86_400_000),
+  IDEMPOTENCY_TTL_MS: z.coerce.number().int().min(1).max(604_800_000).default(86_400_000),
   // Short-lived cache for catalog/preview reads to cut DB load. Kept low so
-  // newly published/delisted resources surface quickly.
-  CATALOG_CACHE_TTL_MS: z.coerce.number().default(10_000),
+  // newly published/delisted resources surface quickly. 0 disables caching.
+  CATALOG_CACHE_TTL_MS: z.coerce.number().int().min(0).max(3_600_000).default(10_000),
   // Max distinct filter/sort/pagination combinations cached for the catalog
   // (#316). Bounds key cardinality; oldest entries are evicted (FIFO).
-  CATALOG_CACHE_MAX_KEYS: z.coerce.number().int().min(1).default(200),
+  CATALOG_CACHE_MAX_KEYS: z.coerce.number().int().min(1).max(100000).default(200),
 
   // Postgres connection pool tuning.
-  DB_POOL_MAX: z.coerce.number().int().min(1).default(10),
-  DB_POOL_IDLE_TIMEOUT_MS: z.coerce.number().int().nonnegative().default(30_000),
-  DB_POOL_CONNECT_TIMEOUT_MS: z.coerce.number().int().nonnegative().default(10_000),
-  DB_STATEMENT_TIMEOUT_MS: z.coerce.number().int().nonnegative().default(30_000),
+  DB_POOL_MAX: z.coerce.number().int().min(1).max(1000).default(10),
+  DB_POOL_IDLE_TIMEOUT_MS: z.coerce.number().int().min(0).max(600000).default(30_000),
+  DB_POOL_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(0).max(600000).default(10_000),
+  DB_STATEMENT_TIMEOUT_MS: z.coerce.number().int().min(0).max(600000).default(30_000),
 });
 
 /** Every environment variable the schema validates (kept in sync with .env.example). */
