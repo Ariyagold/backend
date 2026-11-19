@@ -1148,6 +1148,18 @@ export const openApiSpec = {
             description: "Filter resources by title or description (case-insensitive)",
           },
           {
+            name: "tags",
+            in: "query",
+            required: false,
+            schema: { type: "string" },
+            description:
+              "Filter resources by tag. Provide one or more tags as a comma-separated list " +
+              "(e.g. `tags=ai,dataset`). Matching is exact and case-sensitive, and multiple tags " +
+              "are combined with AND semantics: only resources carrying every listed tag are returned. " +
+              "At most 10 tags may be supplied, each 1-64 characters long; requests exceeding these " +
+              "limits are rejected with 400. Can be combined with `search`, `sort`, `limit` and `offset`.",
+          },
+          {
             name: "sort",
             in: "query",
             required: false,
@@ -2042,36 +2054,49 @@ export const openApiSpec = {
             in: "query",
             required: false,
             schema: { type: "string", format: "date-time" },
-            description: "Only include entries at or after this timestamp",
+            description:
+              "Only include entries at or after this timestamp. Must not be later than `to`; " +
+              "an inverted range is rejected with 400.",
           },
           {
             name: "to",
             in: "query",
             required: false,
             schema: { type: "string", format: "date-time" },
-            description: "Only include entries at or before this timestamp",
+            description:
+              "Only include entries at or before this timestamp. Must not be earlier than `from`; " +
+              "an inverted range is rejected with 400.",
           },
           {
             name: "page",
             in: "query",
             required: false,
             schema: { type: "integer", minimum: 1, default: 1 },
-            description: "Page number (1-based)",
+            description:
+              "Page number (1-based). Must be a strict integer; non-numeric or out-of-range values are rejected with 400.",
           },
           {
             name: "limit",
             in: "query",
             required: false,
             schema: { type: "integer", minimum: 1, maximum: 100, default: 20 },
-            description: "Page size (1-100, default 20)",
+            description:
+              "Page size (1-100, default 20). Must be a strict integer; non-numeric or out-of-range values are rejected with 400.",
           },
         ],
         responses: {
           "200": {
-            description: "Paginated audit log entries",
+            description:
+              "Paginated audit log entries, ordered by `paidAt` then `id` ascending so pages are " +
+              "stable even when multiple entries share the same timestamp.",
             content: {
               "application/json": { schema: { $ref: "#/components/schemas/AdminAuditResponse" } },
             },
+          },
+          "400": {
+            description:
+              "Invalid pagination (non-integer or out-of-range `page`/`limit`) or an inverted `from`/`to` date range",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
           "401": {
             description: "Missing or invalid admin key",

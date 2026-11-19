@@ -20,6 +20,13 @@ export interface TtlCache<T> {
   set(key: string, value: T, ttlMs?: number): void;
   delete(key: string): void;
   clear(): void;
+  /**
+   * Returns the cached value when fresh; otherwise loads it via `loader`,
+   * collapsing concurrent calls for the same key into a single in-flight load.
+   * Distinct keys load independently. A rejected load clears the pending entry
+   * so a later call can retry.
+   */
+  getOrLoad(key: string, loader: () => Promise<T>, ttlMs?: number): Promise<T>;
   /** Number of stored entries (expired ones count until they are next read). */
   readonly size: number;
 }
@@ -46,6 +53,8 @@ export interface TtlCacheOptions {
 // sharing module-level state.
 export function createTtlCache<T>(options: TtlCacheOptions): TtlCache<T> {
   const store = new Map<string, Entry<T>>();
+  // In-flight loads keyed by cache key, so concurrent misses share one load.
+  const pending = new Map<string, Promise<T>>();
   const now = options.now ?? Date.now;
   const defaultTtlMs = options.defaultTtlMs;
   const maxSize = options.maxSize;
@@ -75,11 +84,34 @@ export function createTtlCache<T>(options: TtlCacheOptions): TtlCache<T> {
       }
       store.set(key, { value, expiresAt: now() + (ttlMs ?? defaultTtlMs) });
     },
+    getOrLoad(key, loader, ttlMs) {
+      const cached = this.get(key);
+      if (cached !== undefined) return Promise.resolve(cached);
+
+      const inFlight = pending.get(key);
+      if (inFlight) return inFlight;
+
+      const promise = (async () => {
+        try {
+          const value = await loader();
+          this.set(key, value, ttlMs);
+          return value;
+        } finally {
+          // Clear on both success and failure; on failure this lets a retry
+          // start a fresh load rather than reusing a rejected promise.
+          pending.delete(key);
+        }
+      })();
+      pending.set(key, promise);
+      return promise;
+    },
     delete(key) {
       store.delete(key);
+      pending.delete(key);
     },
     clear() {
       store.clear();
+      pending.clear();
     },
     get size() {
       return store.size;

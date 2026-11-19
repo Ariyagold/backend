@@ -334,6 +334,8 @@ router.get("/resources", async (req, res) => {
   const limit = parsed.data.limit ?? CATALOG_DEFAULT_LIMIT;
   const offset = parsed.data.offset ?? 0;
 
+  // `tags` (#222): exact, case-insensitive matching; multiple tags are ANDed
+  // (a resource must carry every requested tag). Validated by the schema.
   const filters = { ...parsed.data, limit, offset };
 
   let catalog: Awaited<ReturnType<typeof listCatalog>>;
@@ -368,11 +370,27 @@ router.get("/resources", async (req, res) => {
 });
 
 // GET /resources/:id/meta — resource preview (public)
+//
+// Conditional reads (#223): the response carries a stable ETag derived from the
+// public metadata. A matching If-None-Match yields 304 with no body. The
+// validator is only emitted on this public route — private/owner-only
+// responses never reuse it.
 router.get("/resources/:id/meta", async (req, res) => {
   const meta = await getResourceMeta(req.params.id as string);
   if (!meta) {
     throw new AppError("NOT_FOUND", "Resource not found");
   }
+
+  // Weak validator: metadata equality, not byte-for-byte identity.
+  const etag = `W/"${meta.etag}"`;
+  res.setHeader("ETag", etag);
+  res.setHeader("Cache-Control", "public, no-cache");
+
+  if (ifNoneMatchMatches(req.header("If-None-Match"), etag)) {
+    res.status(304).end();
+    return;
+  }
+
   res.json({
     ...meta,
     accessUrl: `${config.BASE_URL}/resources/${meta.id}`,

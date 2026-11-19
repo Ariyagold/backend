@@ -153,6 +153,9 @@ export const resources = pgTable(
       table.verificationStatus,
       table.createdAt,
     ),
+    // Catalog tag filtering (#222): exact-match containment queries
+    // (`tags @> ARRAY[...]`) on the tags array are served by this GIN index.
+    tagsGinIdx: index("idx_resources_tags_gin").using("gin", table.tags),
     // Publisher dashboards list a single publisher's resources (#285).
     publisherIdx: index("idx_resources_publisher_id").on(table.publisherId),
     // Verification-status filters that aren't anchored to `listed` can't use the
