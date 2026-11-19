@@ -58,7 +58,7 @@ import {
   type ExpectedSignedTx,
 } from "../services/registryClient.js";
 import { parsePayerFromXPayment } from "../lib/parseXPayment.js";
-import { recordSettlementOnFinish, recordDeliveryOnClose } from "../lib/paymentSettlement.js";
+import { recordSettlementOnFinish, settlementKeyFromHeader } from "../lib/paymentSettlement.js";
 import { AppError, isAppError } from "../lib/errors.js";
 import { emitToPublisher, enqueueWebhookEvent } from "../services/webhookService.js";
 
@@ -381,25 +381,7 @@ router.get("/resources/:id", dynamicPaywall, async (req, res) => {
 
   // Records a payment row with an explicit delivery status so an undelivered
   // purchase can be reconciled later (#86).
-  const recordPayment = async (deliveryStatus: "delivered" | "undelivered" | "pending") => {
-    const [payment] = await db
-      .insert(payments)
-      .values({
-        resourceId: resource.id,
-        payerAddress,
-        recipientAddress: resource.walletAddress,
-        amount: resource.price,
-        deliveryStatus,
-        // Freeze content identity + pricing terms so the receipt stays
-        // interpretable after the resource is edited or transferred.
-        ...buildPurchaseSnapshot(resource),
-      })
-      .returning();
-    // Starts pending; flips to settled/failed once x402 settles (#99).
-    recordSettlementOnFinish(res, payment.id);
-    return payment;
-  };
-
+  const settlementKey = settlementKeyFromHeader(paymentHeader);
   const emitPurchase = (payment: typeof payments.$inferSelect) => {
     // Fire-and-forget: webhook delivery never delays or fails content access.
     const purchase = {
@@ -414,9 +396,34 @@ router.get("/resources/:id", dynamicPaywall, async (req, res) => {
     void enqueueWebhookEvent(resource.publisherId, "payment.received", purchase);
   };
 
+  // Records a payment row with an explicit delivery status so an undelivered
+  // purchase can be reconciled later (#86). A replayed authorization hits the
+  // unique settlement key and reuses the existing row (#192).
+  const recordPayment = async (deliveryStatus: "delivered" | "undelivered") => {
+    const [inserted] = await db
+      .insert(payments)
+      .values({
+        resourceId: resource.id,
+        payerAddress,
+        recipientAddress: resource.walletAddress,
+        amount: resource.price,
+        deliveryStatus,
+        settlementKey,
+      })
+      .onConflictDoNothing({ target: payments.settlementKey })
+      .returning();
+    if (!inserted) {
+      const [existing] = await db.select().from(payments).where(eq(payments.settlementKey, settlementKey!));
+      return existing;
+    }
+    // Starts pending; flips to settled/failed once x402 settles (#99).
+    // Purchase webhooks fire only after confirmed settlement (#193).
+    recordSettlementOnFinish(res, inserted.id, emitPurchase);
+    return inserted;
+  };
+
   if (resource.resourceType === "link") {
     const payment = await recordPayment("delivered");
-    emitPurchase(payment);
     res.json({
       url: resource.externalUrl,
       receipt: {
@@ -460,9 +467,7 @@ router.get("/resources/:id", dynamicPaywall, async (req, res) => {
     });
   }
 
-  const payment = await recordPayment("pending");
-  recordDeliveryOnClose(res, payment.id);
-  emitPurchase(payment);
+  const payment = await recordPayment("delivered");
 
   // Add receipt info in headers for file downloads
   res.setHeader("X-Payment-Id", payment.id);

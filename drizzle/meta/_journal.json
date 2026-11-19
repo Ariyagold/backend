@@ -209,7 +209,7 @@
       "idx": 29,
       "version": "7",
       "when": 1795040000000,
-      "tag": "0025_verification_review",
+      "tag": "0025_payment_settlement_reference",
       "breakpoints": true
     }
   ]

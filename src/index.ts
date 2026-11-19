@@ -11,6 +11,7 @@ import { rootLogger } from "./lib/logger.js";
 import { beginShutdown, whenDrained, inFlightCount } from "./lib/lifecycle.js";
 import { pgClient } from "./db/client.js";
 import { startPoolMetrics, stopPoolMetrics } from "./db/client.js";
+import { startPaymentReconciliationWorker, stopPaymentReconciliationWorker } from "./workers/paymentReconciliationWorker.js";
 import { startRetryPendingWorker, stopRetryPendingWorker } from "./workers/retryPendingWorker.js";
 import { startEventListener, stopEventListener } from "./workers/eventListener.js";
 import { startWebhookOutboxWorker, stopWebhookOutboxWorker } from "./workers/webhookOutboxWorker.js";
@@ -74,6 +75,7 @@ function startWorkers(): void {
   workersStarted = true;
   rootLogger.info({ event: "workers_started_as_leader" }, "acquired worker leader lock; starting background workers");
   startRetryPendingWorker();
+  startPaymentReconciliationWorker();
   startEventListener();
   startWebhookOutboxWorker();
   startLeaderHealthCheck();
@@ -83,6 +85,7 @@ function stopWorkers(): void {
   if (!workersStarted) return;
   workersStarted = false;
   stopRetryPendingWorker();
+  stopPaymentReconciliationWorker();
   stopEventListener();
   stopWebhookOutboxWorker();
   rootLogger.info({ event: "workers_stopped" }, "background workers stopped");
