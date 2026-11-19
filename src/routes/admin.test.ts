@@ -251,6 +251,96 @@ describe('admin routes', () => {
       expect(chain2.offsetMock).toHaveBeenLastCalledWith(2);
     });
   });
+  describe('GET /admin/payments/exceptions', () => {
+    const paidAt = new Date(Date.now() - 2 * 3600_000).toISOString();
+    const entry = {
+      id: 'p1', resourceId: 'r1', payer: 'GPAYER', recipient: 'GRECIP', amount: '1.00',
+      status: 'pending', deliveryStatus: 'undelivered', paidAt,
+    };
+    const summary = {
+      total: 3, pending: 2, settled: 0, failed: 1, delivered: 2, undelivered: 1,
+      under1h: 0, from1hTo24h: 3, from1dTo7d: 0, over7d: 0, oldestPaidAt: paidAt,
+    };
+
+    function setup(entries: unknown[], summaryRows: unknown[]) {
+      const db = dbClient.db as any;
+      const limitMock = vi.fn().mockResolvedValue(entries);
+      const orderByMock = vi.fn().mockReturnValue({ limit: limitMock });
+      const entriesWhere = vi.fn().mockReturnValue({ orderBy: orderByMock });
+      const summaryWhere = vi.fn().mockResolvedValue(summaryRows);
+      db.select
+        .mockReset()
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: entriesWhere }) })
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: summaryWhere }) });
+      return { limitMock, entriesWhere, summaryWhere };
+    }
+
+    beforeEach(() => {
+      mockConfig.ADMIN_API_KEY = 'secret-key';
+    });
+
+    it('requires the admin key', async () => {
+      const res = await request(buildApp()).get('/admin/payments/exceptions');
+      expect(res.status).toBe(401);
+    });
+
+    it('returns bounded entries with ages and whole-set summary counts', async () => {
+      const { limitMock } = setup([entry], [summary]);
+      const res = await request(buildApp())
+        .get('/admin/payments/exceptions?settlement=pending,failed&delivery=undelivered&minAgeMinutes=60&limit=1')
+        .set('X-Admin-Key', 'secret-key');
+
+      expect(res.status).toBe(200);
+      expect(limitMock).toHaveBeenCalledWith(1);
+      expect(res.body.filters).toEqual({
+        settlement: ['pending', 'failed'], delivery: ['undelivered'], minAgeMinutes: 60, defaultExceptionSet: false,
+      });
+      expect(res.body.truncated).toBe(true);
+      expect(res.body.entries).toHaveLength(1);
+      expect(res.body.entries[0].ageSeconds).toBeGreaterThanOrEqual(7200);
+      expect(res.body.summary).toMatchObject({
+        total: 3,
+        bySettlement: { pending: 2, settled: 0, failed: 1 },
+        byDelivery: { delivered: 2, undelivered: 1 },
+        byAge: { under1h: 0, from1hTo24h: 3, from1dTo7d: 0, over7d: 0 },
+        oldestPaidAt: paidAt,
+      });
+      expect(res.body.summary.oldestAgeSeconds).toBeGreaterThanOrEqual(7200);
+    });
+
+    it('uses the default exception set and clamps limit to 200', async () => {
+      const { limitMock } = setup([], [{ ...summary, total: 0, oldestPaidAt: null }]);
+      const res = await request(buildApp())
+        .get('/admin/payments/exceptions?limit=5000')
+        .set('X-Admin-Key', 'secret-key');
+      expect(res.status).toBe(200);
+      expect(limitMock).toHaveBeenCalledWith(200);
+      expect(res.body.filters.defaultExceptionSet).toBe(true);
+      expect(res.body.truncated).toBe(false);
+      expect(res.body.summary.oldestPaidAt).toBeNull();
+      expect(res.body.summary.oldestAgeSeconds).toBeNull();
+    });
+
+    it.each([
+      'settlement=bogus',
+      'delivery=lost',
+      'settlement=',
+      'minAgeMinutes=-5',
+      'minAgeMinutes=abc',
+      'minAgeMinutes=99999999',
+    ])('rejects invalid filter %s', async (qs) => {
+      setup([], [summary]);
+      const res = await request(buildApp())
+        .get(`/admin/payments/exceptions?${qs}`)
+        .set('X-Admin-Key', 'secret-key');
+      // empty settlement is treated as "not provided"
+      if (qs === 'settlement=') {
+        expect(res.status).toBe(200);
+      } else {
+        expect(res.status).toBe(400);
+      }
+    });
+  });
 });
 
 describe('verification review workflow (#188)', () => {

@@ -9,6 +9,7 @@ import { publishers, webhookOutbox } from "../db/schema.js";
 import { getLogger } from "../lib/logger.js";
 import { CURRENT_WEBHOOK_VERSION, type WebhookEvent } from "../schemas/webhooks.js";
 import { decryptWebhookSecret } from "../utils/crypto.js";
+import { webhookKeyring } from "../lib/secretKeys.js";
 
 export type { WebhookEvent } from "../schemas/webhooks.js";
 export { CURRENT_WEBHOOK_VERSION } from "../schemas/webhooks.js";
@@ -220,9 +221,8 @@ export async function resolveTarget(publisherId: string): Promise<WebhookTarget 
   // Decrypt the stored secret if an encryption key is configured (#47).
   let secret: string | undefined;
   if (row.secret) {
-    secret = config.WEBHOOK_ENCRYPTION_KEY
-      ? (decryptWebhookSecret(row.secret, config.WEBHOOK_ENCRYPTION_KEY) ?? row.secret)
-      : row.secret;
+    const keyring = webhookKeyring();
+    secret = keyring ? (decryptWebhookSecret(row.secret, keyring) ?? row.secret) : row.secret;
   }
 
   return {

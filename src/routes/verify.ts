@@ -8,6 +8,7 @@ import { checkOriginality } from "../services/verificationService.js";
 import { enqueueWebhookEvent } from "../services/webhookService.js";
 
 import { config } from "../config.js";
+import { buildPurchaseSnapshot } from "../lib/purchaseSnapshot.js";
 import { AppError } from "../lib/errors.js";
 import { INPUT_CONTRACT_VERSION, type ReviewResourceType } from "../lib/verificationContract.js";
 import { getLogger } from "../lib/logger.js";
@@ -93,6 +94,9 @@ async function checkResourceForVerification(req: Request, res: Response, next: N
   if (resource.adminDelistedAt) {
     throw new AppError("FORBIDDEN", "Resource was delisted by an administrator and cannot be relisted");
   }
+  // Kept for the fee's purchase snapshot so its receipt records which
+  // content was verified even if the resource changes later.
+  _res.locals.verificationResource = resource;
   // Non-string content is rejected by validate() after payment; only hash-check real strings here.
   if (typeof content === "string" && !contentMatchesResource(content, resource)) {
     throw new AppError("CONFLICT", "Content does not match the resource's stored content");
@@ -214,6 +218,7 @@ router.post(
             payerAddress: payer ?? "unknown",
             recipientAddress: config.PAY_TO,
             amount: config.VERIFICATION_PRICE,
+            ...buildPurchaseSnapshot(res.locals.verificationResource ?? null),
           })
           .returning({ id: payments.id });
 
