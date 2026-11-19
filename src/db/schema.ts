@@ -117,6 +117,9 @@ export const resources = pgTable(
     contentHash: text("content_hash"),
     externalUrl: text("external_url"),
     mimeType: text("mime_type"),
+    // Retained object size in bytes (#234). Persisted so per-publisher storage
+    // quota accounting can be reconciled against actual stored objects.
+    sizeBytes: integer("size_bytes"),
     verificationStatus: verificationStatusEnum("verification_status").notNull().default("pending"),
     verificationId: text("verification_id"),
     // Monotonic per-resource verification generation (#183). Each new check
@@ -179,6 +182,85 @@ export const resources = pgTable(
       "resources_verification_generation_nonneg",
       sql`${table.verificationGeneration} >= 0`,
     ),
+    // Retained byte sizes can't be negative (#234).
+    sizeBytesNonNegative: check(
+      "resources_size_bytes_nonneg",
+      sql`${table.sizeBytes} IS NULL OR ${table.sizeBytes} >= 0`,
+    ),
+  }),
+);
+
+// Catalog version token (#224). A single row holds a monotonically increasing
+// counter bumped on every catalog/metadata mutation. Replicas compare their
+// locally cached version against this shared token to detect remote
+// invalidations instead of waiting for TTL expiry.
+export const catalogVersion = pgTable(
+  "catalog_version",
+  {
+    // Fixed singleton key so exactly one row exists.
+    id: text("id").primaryKey().default("global"),
+    // Monotonic token; bumped on every catalog/metadata mutation.
+    version: integer("version").notNull().default(0),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    versionNonNegative: check("catalog_version_version_nonneg", sql`${table.version} >= 0`),
+  }),
+);
+
+// Per-publisher storage accounting (#234). One row per publisher tracks bytes
+// reserved by in-flight uploads and bytes retained by stored objects, so the
+// quota gate is shared across replicas and concurrent uploads can't overshoot.
+export const publisherStorageUsage = pgTable(
+  "publisher_storage_usage",
+  {
+    publisherId: text("publisher_id")
+      .primaryKey()
+      .references(() => publishers.id),
+    // Bytes reserved by uploads that have not yet committed or released.
+    reservedBytes: integer("reserved_bytes").notNull().default(0),
+    // Bytes retained by successfully stored objects.
+    usedBytes: integer("used_bytes").notNull().default(0),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    reservedBytesNonNegative: check(
+      "publisher_storage_usage_reserved_nonneg",
+      sql`${table.reservedBytes} >= 0`,
+    ),
+    usedBytesNonNegative: check(
+      "publisher_storage_usage_used_nonneg",
+      sql`${table.usedBytes} >= 0`,
+    ),
+  }),
+);
+
+// Storage reservations (#234). Each in-flight upload reserves bytes before the
+// storage write; the reservation is committed (moved to used) on success or
+// released on failure.
+export const storageReservations = pgTable(
+  "storage_reservations",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => createId()),
+    publisherId: text("publisher_id")
+      .notNull()
+      .references(() => publishers.id),
+    resourceId: text("resource_id").references(() => resources.id),
+    // Bytes reserved for this upload.
+    bytes: integer("bytes").notNull(),
+    // "reserved" while in flight, "committed" once stored, "released" on failure.
+    status: text("status").notNull().default("reserved"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    publisherStatusIdx: index("idx_storage_reservations_publisher_status").on(
+      table.publisherId,
+      table.status,
+    ),
+    bytesPositive: check("storage_reservations_bytes_positive", sql`${table.bytes} > 0`),
   }),
 );
 

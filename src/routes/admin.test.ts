@@ -343,6 +343,103 @@ describe('admin routes', () => {
   });
 });
 
+describe('GET /admin/moderation-history (#228)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockConfig.ADMIN_API_KEY = 'secret-key';
+  });
+
+  function setup(entries: unknown[]) {
+    const db = dbClient.db as any;
+    const offsetMock = vi.fn().mockResolvedValue(entries);
+    const limitMock = vi.fn().mockReturnValue({ offset: offsetMock });
+    const orderByMock = vi.fn().mockReturnValue({ limit: limitMock });
+    const whereMock = vi.fn().mockReturnValue({ orderBy: orderByMock });
+    const fromMock = vi.fn().mockReturnValue({ where: whereMock });
+    db.select.mockReset().mockReturnValue({ from: fromMock });
+    return { offsetMock, limitMock, orderByMock, whereMock, fromMock };
+  }
+
+  it('requires the admin key', async () => {
+    setup([]);
+    const res = await request(buildApp()).get('/admin/moderation-history');
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects a wrong admin key', async () => {
+    setup([]);
+    const res = await request(buildApp())
+      .get('/admin/moderation-history')
+      .set('X-Admin-Key', 'wrong-key');
+    expect(res.status).toBe(401);
+  });
+
+  it('returns immutable event details with pagination metadata', async () => {
+    const createdAt = new Date().toISOString();
+    const entries = [
+      { id: 'e1', resourceId: 'r1', action: 'delist', actor: 'admin:abc', reason: 'x', createdAt },
+    ];
+    setup(entries);
+
+    const res = await request(buildApp())
+      .get('/admin/moderation-history')
+      .set('X-Admin-Key', 'secret-key');
+
+    expect(res.status).toBe(200);
+    expect(res.body.entries).toEqual(entries);
+    expect(res.body).toMatchObject({ page: 1, limit: 50 });
+    expect(res.body).toHaveProperty('hasMore');
+  });
+
+  it('applies resource, actor and time filters', async () => {
+    const { whereMock } = setup([]);
+    const from = '2024-01-01T00:00:00.000Z';
+    const to = '2024-02-01T00:00:00.000Z';
+
+    const res = await request(buildApp())
+      .get('/admin/moderation-history')
+      .query({ resourceId: 'r1', actor: 'admin:abc', from, to })
+      .set('X-Admin-Key', 'secret-key');
+
+    expect(res.status).toBe(200);
+    expect(whereMock).toHaveBeenCalledTimes(1);
+    expect(res.body.filters).toMatchObject({
+      resourceId: 'r1',
+      actor: 'admin:abc',
+      from,
+      to,
+    });
+  });
+
+  it('clamps limit to [1,200] and page to >=1', async () => {
+    const chain1 = setup([]);
+    const app = buildApp();
+    await request(app)
+      .get('/admin/moderation-history?limit=9999&page=0')
+      .set('X-Admin-Key', 'secret-key');
+    expect(chain1.limitMock).toHaveBeenLastCalledWith(200);
+    expect(chain1.offsetMock).toHaveBeenLastCalledWith(0);
+
+    const chain2 = setup([]);
+    await request(app)
+      .get('/admin/moderation-history?limit=1&page=3')
+      .set('X-Admin-Key', 'secret-key');
+    expect(chain2.limitMock).toHaveBeenLastCalledWith(1);
+    expect(chain2.offsetMock).toHaveBeenLastCalledWith(2);
+  });
+
+  it.each(['from=not-a-date', 'to=not-a-date', 'limit=abc', 'page=abc'])(
+    'rejects invalid query %s',
+    async (qs) => {
+      setup([]);
+      const res = await request(buildApp())
+        .get(`/admin/moderation-history?${qs}`)
+        .set('X-Admin-Key', 'secret-key');
+      expect(res.status).toBe(400);
+    },
+  );
+});
+
 describe('verification review workflow (#188)', () => {
   beforeEach(() => {
     mockConfig.ADMIN_API_KEY = 'k';
