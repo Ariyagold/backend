@@ -3,6 +3,7 @@ import type { z } from "zod/v4";
 import { AppError } from "../lib/errors.js";
 import { apiKeyAuth } from "../middleware/apiKeyAuth.js";
 import { requestSignatureAuth } from "../middleware/requestSignatureAuth.js";
+import { noStore } from "../middleware/security.js";
 import { publisherRateLimit, registerIpRateLimit } from "../middleware/rateLimiters.js";
 import { validate } from "../middleware/validate.js";
 import {
@@ -10,21 +11,28 @@ import {
   updateRateLimitSchema,
   updateWebhookConfigSchema,
 } from "../schemas/requests.js";
-import { registerPublisher, getPublisherResources, rotateApiKey, rotateSigningSecret } from "../services/publisherService.js";
+import {
+  registerPublisher,
+  getPublisherResources,
+  rotateApiKey,
+  rotateSigningSecret,
+  encodeWebhookSecretForStorage,
+} from "../services/publisherService.js";
 import { deliver, webhookUrlProblem } from "../services/webhookService.js";
 import { replayWebhookDelivery } from "../workers/webhookOutboxWorker.js";
 import { eq, inArray, sum, count, sql, desc } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { publishers, resources, payments, webhookOutbox } from "../db/schema.js";
 import { config } from "../config.js";
-import { encryptWebhookSecret, decryptWebhookSecret } from "../utils/crypto.js";
+import { decryptWebhookSecret } from "../utils/crypto.js";
+import { webhookKeyring } from "../lib/secretKeys.js";
 
 const router: RouterType = Router();
 
 type UpdateWebhookConfig = z.infer<typeof updateWebhookConfigSchema>;
 
 // POST /publishers — register a new publisher (public)
-router.post("/publishers", registerIpRateLimit, validate(publisherRegisterSchema), async (req, res) => {
+router.post("/publishers", noStore, registerIpRateLimit, validate(publisherRegisterSchema), async (req, res) => {
   try {
     const { publisher, apiKey, signingSecret } = await registerPublisher(req.body);
     res.status(201).json({
@@ -86,7 +94,7 @@ router.get("/publishers/me/resources", apiKeyAuth, async (req, res) => {
 
 // POST /publishers/me/api-keys/rotate — issue a new key, invalidate the old one (#40)
 // The new key is returned once in plaintext; the old key is immediately invalid.
-router.post("/publishers/me/api-keys/rotate", apiKeyAuth, publisherRateLimit, async (req, res) => {
+router.post("/publishers/me/api-keys/rotate", noStore, apiKeyAuth, publisherRateLimit, async (req, res) => {
   const newApiKey = await rotateApiKey(req.publisher!.id);
   res.json({
     apiKey: newApiKey, // shown once — store it securely
@@ -97,7 +105,7 @@ router.post("/publishers/me/api-keys/rotate", apiKeyAuth, publisherRateLimit, as
 // POST /publishers/me/signing-secret/rotate — issue a new HMAC signing secret (#42)
 // The new secret is returned once in plaintext; all existing request signatures
 // signed with the old secret are immediately invalid.
-router.post("/publishers/me/signing-secret/rotate", apiKeyAuth, publisherRateLimit, async (req, res) => {
+router.post("/publishers/me/signing-secret/rotate", noStore, apiKeyAuth, publisherRateLimit, async (req, res) => {
   const newSigningSecret = await rotateSigningSecret(req.publisher!.id);
   res.json({
     signingSecret: newSigningSecret, // shown once — store it securely, use as HMAC secret
@@ -267,19 +275,18 @@ router.patch(
       throw new AppError("VALIDATION_ERROR", "webhookUrl is required to enable webhooks");
     }
 
+    // Encode before touching the DB so a rejected secret (encryption required
+    // but unavailable) leaves the stored configuration unchanged.
+    const storedSecret =
+      body.webhookSecret === undefined || body.webhookSecret === null
+        ? body.webhookSecret
+        : encodeWebhookSecretForStorage(body.webhookSecret);
+
     const [updated] = await db
       .update(publishers)
       .set({
         ...(body.webhookUrl !== undefined ? { webhookUrl: body.webhookUrl } : {}),
-        ...(body.webhookSecret !== undefined
-          ? {
-              webhookSecret: body.webhookSecret === null
-                ? null
-                : config.WEBHOOK_ENCRYPTION_KEY
-                  ? encryptWebhookSecret(body.webhookSecret, config.WEBHOOK_ENCRYPTION_KEY)
-                  : body.webhookSecret,
-            }
-          : {}),
+        ...(storedSecret !== undefined ? { webhookSecret: storedSecret } : {}),
         ...(body.webhookEvents !== undefined ? { webhookEvents: body.webhookEvents } : {}),
         // Clearing the URL always disables delivery.
         ...(body.webhookUrl === null
@@ -306,9 +313,8 @@ router.post("/publishers/me/webhooks/test", apiKeyAuth, publisherRateLimit, asyn
   // Decrypt the stored secret before using it for HMAC signing (#47).
   let secret: string | undefined;
   if (pub.webhookSecret) {
-    secret = config.WEBHOOK_ENCRYPTION_KEY
-      ? (decryptWebhookSecret(pub.webhookSecret, config.WEBHOOK_ENCRYPTION_KEY) ?? pub.webhookSecret)
-      : pub.webhookSecret;
+    const keyring = webhookKeyring();
+    secret = keyring ? (decryptWebhookSecret(pub.webhookSecret, keyring) ?? pub.webhookSecret) : pub.webhookSecret;
   }
 
   // Single attempt: the caller is waiting on this request.

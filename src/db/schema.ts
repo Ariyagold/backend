@@ -65,6 +65,8 @@ export const publishers = pgTable(
     rateLimitRpm: integer("rate_limit_rpm"),
     // Webhook delivery configuration. Nullable so publishers can opt in later.
     webhookUrl: text("webhook_url"),
+    // Encrypted with WEBHOOK_ENCRYPTION_KEY as `v1:<keyId>:<base64>` (legacy
+    // rows may be un-prefixed ciphertext or plaintext) — see src/utils/crypto.ts.
     webhookSecret: text("webhook_secret"),
     // Subscribed WebhookEvent values; null/empty means all events.
     webhookEvents: text("webhook_events").array(),
@@ -72,6 +74,7 @@ export const publishers = pgTable(
     // Per-publisher HMAC signing secret (shown once on creation/rotation, stored
     // encrypted). Used by requestSignatureAuth (#42) instead of the raw API key
     // so possession of the key alone is insufficient to forge a valid signature.
+    // Stored as `v1:<keyId>:<base64>` so keys rotate without an atomic rewrite.
     signingSecret: text("signing_secret"),
     // Set when the publisher rotates their API key. Any key whose hash matches
     // a row with a non-null api_key_revoked_at is rejected by apiKeyAuth (#40).

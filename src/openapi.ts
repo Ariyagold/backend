@@ -37,8 +37,10 @@ export const openApiSpec = {
         in: "header",
         name: "x-wallet-signature",
         description:
-          "Base64 Stellar Ed25519 signature of `synapsvault-wallet-auth-v1\\nGET\\n{request path}\\n{unix timestamp}`. " +
-          "The timestamp must be within five minutes of server time.",
+          "Base64 Stellar Ed25519 signature of `synapsvault-wallet-auth-v2\\n{METHOD}\\n{request path}\\n{canonical query}\\n{unix timestamp}`. " +
+          "The canonical query is the query parameters decoded, sorted by key then value, RFC 3986 percent-encoded and joined with `&` (empty when there is no query). " +
+          "The timestamp must be within five minutes of server time. " +
+          "The deprecated v1 message (`synapsvault-wallet-auth-v1\\n{METHOD}\\n{request path}\\n{unix timestamp}`) is only accepted for requests without a query string.",
       },
       RequestSignature: {
         type: "apiKey",
@@ -591,7 +593,7 @@ export const openApiSpec = {
         summary: "List payments made by a buyer",
         operationId: "getBuyerPayments",
         description:
-          "Requires a signature from the Stellar account at `address`. Sign `synapsvault-wallet-auth-v1\\nGET\\n{request path}\\n{unix timestamp}` and send it in X-Wallet-Signature with X-Wallet-Timestamp.",
+          "Requires a signature from the Stellar account at `address`. Sign `synapsvault-wallet-auth-v2\\nGET\\n{request path}\\n{canonical query}\\n{unix timestamp}` and send it in X-Wallet-Signature with X-Wallet-Timestamp.",
         security: [{ WalletSignatureAuth: [] }],
         parameters: [
           {
