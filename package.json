@@ -27,6 +27,7 @@
     "setup-usdc": "tsx scripts/setup-usdc.ts",
     "e2e": "tsx scripts/e2e-test.ts",
     "reconcile": "tsx scripts/reconcile.ts",
+    "secrets:reencrypt": "tsx scripts/reencrypt-secrets.ts",
     "seed": "tsx scripts/seed.ts",
     "audit:storage-integrity": "tsx scripts/audit-storage-integrity.ts",
     "pretest": "npm run build:registry-client",

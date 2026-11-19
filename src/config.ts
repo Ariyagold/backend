@@ -270,10 +270,25 @@ export const envSchema = z.object({
   // AES-256 key used to encrypt per-publisher signing secrets at rest (#42).
   // Required when REQUIRE_REQUEST_SIGNATURE is true.
   SIGNING_SECRET_KEY: z.string().min(16).optional(),
+  // Comma-separated retired signing-secret keys kept for decryption only
+  // during a key rotation. New ciphertext always uses SIGNING_SECRET_KEY;
+  // run `npm run secrets:reencrypt` and then drop the old key from this list.
+  SIGNING_SECRET_LEGACY_KEYS: z.string().optional(),
 
   // AES-256 key used to encrypt webhook secrets at rest (#47).
-  // Optional — when unset webhook secrets are NOT encrypted (logged as warning).
+  // When unset, webhook secret writes are rejected if
+  // WEBHOOK_SECRET_ENCRYPTION_REQUIRED is on; otherwise they are stored as
+  // plain text (logged as a warning).
   WEBHOOK_ENCRYPTION_KEY: z.string().min(16).optional(),
+  // Comma-separated retired webhook encryption keys (decrypt-only), see
+  // SIGNING_SECRET_LEGACY_KEYS for the rotation procedure.
+  WEBHOOK_ENCRYPTION_LEGACY_KEYS: z.string().optional(),
+  // Refuse to store new webhook secrets unless WEBHOOK_ENCRYPTION_KEY is set.
+  // Defaults to true in production; false elsewhere. Existing plaintext rows
+  // keep working — see docs/secret-key-rotation.md#plaintext-rows.
+  WEBHOOK_SECRET_ENCRYPTION_REQUIRED: envFlag(
+    typeof process !== "undefined" && (process.env.NODE_ENV ?? "development") === "production",
+  ),
 
   // Admin panel protection key (#49). Optional — when unset admin routes are
   // disabled (return 401) and a warning is logged at boot.
@@ -405,7 +420,18 @@ if (!parsed.data.ADMIN_API_KEY) {
 }
 
 // ── Boot-time security warnings (#47) ────────────────────────────────────────
-if (!parsed.data.WEBHOOK_ENCRYPTION_KEY) {
+if (!parsed.data.WEBHOOK_ENCRYPTION_KEY && parsed.data.WEBHOOK_SECRET_ENCRYPTION_REQUIRED) {
+  rootLogger.error(
+    { event: "config_webhook_encryption_required_key_missing" },
+    "[security] WEBHOOK_SECRET_ENCRYPTION_REQUIRED is on but WEBHOOK_ENCRYPTION_KEY is not " +
+    "set — requests that store a webhook secret will be rejected with 503. Webhooks " +
+    "without a secret and existing rows are unaffected.",
+  );
+  console.error(
+    "[config] WEBHOOK_ENCRYPTION_KEY: not set while WEBHOOK_SECRET_ENCRYPTION_REQUIRED=true; " +
+    "webhook secret writes will be rejected.",
+  );
+} else if (!parsed.data.WEBHOOK_ENCRYPTION_KEY) {
   rootLogger.warn(
     { event: "config_webhook_encryption_key_missing" },
     "[security] WEBHOOK_ENCRYPTION_KEY is not set — webhook secrets will be stored " +
