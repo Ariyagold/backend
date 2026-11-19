@@ -57,3 +57,29 @@ Deployments that ran without an encryption key have plaintext rows. By default
 the command reports them as `plaintext_skipped`. Once a key is configured, pass
 `--encrypt-plaintext` to encrypt them in place. Read paths keep accepting the
 legacy plaintext value until it has been migrated.
+
+## Webhook secret encryption enforcement
+
+`WEBHOOK_SECRET_ENCRYPTION_REQUIRED` (default **true** in production, false
+elsewhere) controls what happens when `WEBHOOK_ENCRYPTION_KEY` is not set:
+
+| Request to `PATCH /publishers/me/webhooks` | Key set | Key unset, required | Key unset, not required |
+| --- | --- | --- | --- |
+| sets `webhookSecret` | stored encrypted | **rejected — 503 `SERVICE_UNAVAILABLE`**, nothing persisted | stored as plaintext (boot warning) |
+| `webhookSecret: null`, URL/events/enabled changes, disabling webhooks | allowed | allowed | allowed |
+
+A rejected request writes nothing (not even the URL), so a publisher is never
+left with a webhook configured but no secret by accident. The boot log reports
+`config_webhook_encryption_required_key_missing` when enforcement is on without
+a key.
+
+Migration behaviour for **existing** plaintext webhook secrets:
+
+- Enforcement only applies to new writes. Existing plaintext rows keep being
+  used for delivery and test events, before and after a key is configured
+  (values that don't decrypt are used as-is, exactly as before).
+- To migrate them: set `WEBHOOK_ENCRYPTION_KEY`, deploy, then run
+  `npm run secrets:reencrypt -- --field webhook --encrypt-plaintext`
+  (try `--dry-run` first; the `plaintext_skipped` count shows how many remain).
+- Disabled webhooks (`webhookEnabled=false`) are migrated the same way; their
+  secrets are encrypted but nothing is delivered.

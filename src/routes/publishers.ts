@@ -10,14 +10,20 @@ import {
   updateRateLimitSchema,
   updateWebhookConfigSchema,
 } from "../schemas/requests.js";
-import { registerPublisher, getPublisherResources, rotateApiKey, rotateSigningSecret } from "../services/publisherService.js";
+import {
+  registerPublisher,
+  getPublisherResources,
+  rotateApiKey,
+  rotateSigningSecret,
+  encodeWebhookSecretForStorage,
+} from "../services/publisherService.js";
 import { deliver, webhookUrlProblem } from "../services/webhookService.js";
 import { replayWebhookDelivery } from "../workers/webhookOutboxWorker.js";
 import { eq, inArray, sum, count, sql, desc } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { publishers, resources, payments, webhookOutbox } from "../db/schema.js";
 import { config } from "../config.js";
-import { encryptWebhookSecret, decryptWebhookSecret } from "../utils/crypto.js";
+import { decryptWebhookSecret } from "../utils/crypto.js";
 import { webhookKeyring } from "../lib/secretKeys.js";
 
 const router: RouterType = Router();
@@ -268,20 +274,18 @@ router.patch(
       throw new AppError("VALIDATION_ERROR", "webhookUrl is required to enable webhooks");
     }
 
-    const keyring = webhookKeyring();
+    // Encode before touching the DB so a rejected secret (encryption required
+    // but unavailable) leaves the stored configuration unchanged.
+    const storedSecret =
+      body.webhookSecret === undefined || body.webhookSecret === null
+        ? body.webhookSecret
+        : encodeWebhookSecretForStorage(body.webhookSecret);
+
     const [updated] = await db
       .update(publishers)
       .set({
         ...(body.webhookUrl !== undefined ? { webhookUrl: body.webhookUrl } : {}),
-        ...(body.webhookSecret !== undefined
-          ? {
-              webhookSecret: body.webhookSecret === null
-                ? null
-                : keyring
-                  ? encryptWebhookSecret(body.webhookSecret, keyring)
-                  : body.webhookSecret,
-            }
-          : {}),
+        ...(storedSecret !== undefined ? { webhookSecret: storedSecret } : {}),
         ...(body.webhookEvents !== undefined ? { webhookEvents: body.webhookEvents } : {}),
         // Clearing the URL always disables delivery.
         ...(body.webhookUrl === null

@@ -1,8 +1,16 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { publishers, resources } from "../db/schema.js";
-import { generateApiKey, hashApiKey, generateSigningSecret, encryptSigningSecret } from "../utils/crypto.js";
-import { signingKeyring } from "../lib/secretKeys.js";
+import {
+  generateApiKey,
+  hashApiKey,
+  generateSigningSecret,
+  encryptSigningSecret,
+  encryptWebhookSecret,
+} from "../utils/crypto.js";
+import { signingKeyring, webhookKeyring } from "../lib/secretKeys.js";
+import { config } from "../config.js";
+import { AppError } from "../lib/errors.js";
 
 export async function registerPublisher(data: {
   name: string;
@@ -106,4 +114,28 @@ export async function getPublisherWebhookConfig(publisherId: string) {
     events: publisher.webhookEvents ?? [],
     enabled: publisher.webhookEnabled ?? false,
   };
+}
+
+type WebhookSecretConfig = Parameters<typeof webhookKeyring>[0] & {
+  WEBHOOK_SECRET_ENCRYPTION_REQUIRED?: boolean;
+};
+
+/**
+ * Prepare a webhook secret for storage (#47).
+ *
+ * Encrypts with the active WEBHOOK_ENCRYPTION_KEY. When no key is configured
+ * the write is rejected if WEBHOOK_SECRET_ENCRYPTION_REQUIRED is on (default in
+ * production); otherwise the secret is stored as plain text for dev setups.
+ * Only new writes are affected — existing plaintext rows keep being delivered.
+ */
+export function encodeWebhookSecretForStorage(secret: string, cfg: WebhookSecretConfig = config): string {
+  const keyring = webhookKeyring(cfg);
+  if (keyring) return encryptWebhookSecret(secret, keyring);
+  if (cfg.WEBHOOK_SECRET_ENCRYPTION_REQUIRED) {
+    throw new AppError(
+      "SERVICE_UNAVAILABLE",
+      "Webhook secrets cannot be stored: encryption at rest is required but not configured on this server",
+    );
+  }
+  return secret;
 }
