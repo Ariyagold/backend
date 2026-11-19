@@ -5,6 +5,12 @@ import { db } from "../db/client.js";
 import { payments, publishers } from "../db/schema.js";
 import { AppError } from "../lib/errors.js";
 import { hashApiKey } from "../utils/crypto.js";
+import { noStore } from "../middleware/security.js";
+import {
+  buildWalletAuthMessageV1,
+  buildWalletAuthMessageV2,
+  rawQueryFromUrl,
+} from "../utils/walletAuth.js";
 
 const router: RouterType = Router();
 const WALLET_SIGNATURE_MAX_AGE_SECONDS = 300;
@@ -27,8 +33,16 @@ function verifyWalletSignature(req: import("express").Request, address: string):
   try {
     const signatureBytes = Buffer.from(signature, "base64");
     if (signatureBytes.length !== 64 || signatureBytes.toString("base64") !== signature) return false;
-    const message = `synapsvault-wallet-auth-v1\n${req.method}\n${req.path}\n${timestamp}`;
-    return Keypair.fromPublicKey(address).verify(Buffer.from(message, "utf8"), signatureBytes);
+    const keypair = Keypair.fromPublicKey(address);
+    const rawQuery = rawQueryFromUrl(req.originalUrl);
+    const v2 = buildWalletAuthMessageV2({ method: req.method, path: req.path, rawQuery, timestamp });
+    if (keypair.verify(Buffer.from(v2, "utf8"), signatureBytes)) return true;
+
+    // Legacy v1 messages do not bind the query string, so they are only
+    // accepted for requests that have none (see docs/wallet-auth.md).
+    if (rawQuery !== "") return false;
+    const v1 = buildWalletAuthMessageV1({ method: req.method, path: req.path, timestamp });
+    return keypair.verify(Buffer.from(v1, "utf8"), signatureBytes);
   } catch {
     return false;
   }
@@ -42,8 +56,11 @@ async function findPublisherForApiKey(key: string) {
     .then((rows) => rows[0] ?? null);
 }
 
+// Private financial responses are never cached by browsers or shared proxies
+// (see noStore in middleware/security.ts).
+
 // GET /payments/:id/receipt — payment receipt endpoint
-router.get("/payments/:id/receipt", async (req, res) => {
+router.get("/payments/:id/receipt", noStore, async (req, res) => {
   const walletAddressHeader = req.headers["x-wallet-address"];
   const walletAddress = typeof walletAddressHeader === "string" ? walletAddressHeader : undefined;
   const walletAuthorized = walletAddress !== undefined && verifyWalletSignature(req, walletAddress);
@@ -82,7 +99,7 @@ router.get("/payments/:id/receipt", async (req, res) => {
 });
 
 // GET /buyers/:address/payments — buyer payment history
-router.get("/buyers/:address/payments", async (req, res) => {
+router.get("/buyers/:address/payments", noStore, async (req, res) => {
   const address = req.params.address as string;
   if (!verifyWalletSignature(req, address)) {
     throw new AppError("UNAUTHORIZED", "Valid wallet signature required");

@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import express from "express";
 import request from "supertest";
-import { securityHeaders } from "./security.js";
+import { noStore, securityHeaders } from "./security.js";
 
 function makeApp() {
   const app = express();
@@ -49,5 +49,21 @@ describe("securityHeaders", () => {
 
     expect(json.headers["x-content-type-options"]).toBe("nosniff");
     expect(docs.headers["x-content-type-options"]).toBe("nosniff");
+  });
+});
+
+describe("noStore", () => {
+  it("sets no-store cache headers on success and error responses", async () => {
+    const app = express();
+    app.get("/ok", noStore, (_req, res) => res.json({ ok: true }));
+    app.get("/err", noStore, (_req, res) => res.status(401).json({ error: "nope" }));
+
+    for (const [path, status] of [["/ok", 200], ["/err", 401]] as const) {
+      const res = await request(app).get(path);
+      expect(res.status).toBe(status);
+      expect(res.headers["cache-control"]).toBe("no-store");
+      expect(res.headers["pragma"]).toBe("no-cache");
+      expect(res.headers["expires"]).toBe("0");
+    }
   });
 });
