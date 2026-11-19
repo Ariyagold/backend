@@ -1,9 +1,10 @@
 import { eq, and, desc, asc, isNull } from "drizzle-orm";
+import { createHash } from "node:crypto";
 import { db } from "../db/client.js";
 import { resources, publishers, verifications, moderationEvents } from "../db/schema.js";
 import { uploadFile, deleteFile } from "../storage/supabaseStorage.js";
 import { hashFileResource, hashLinkResource } from "../utils/crypto.js";
-import { createTtlCache } from "../lib/ttlCache.js";
+import { createTtlCache, createSingleFlight } from "../lib/ttlCache.js";
 import { config } from "../config.js";
 import { enqueueWebhookEvent } from "./webhookService.js";
 import { enqueueStorageCleanup, enqueueThumbnailJob } from "./workerQueue.js";
@@ -17,6 +18,12 @@ const readCache = createTtlCache<unknown>({
   defaultTtlMs: config.CATALOG_CACHE_TTL_MS,
   cacheName: "catalog_read",
 });
+
+// Single-flight loaders (#225): concurrent misses for the same key share one
+// DB load instead of each issuing its own query. Distinct keys stay
+// independent, and a failed load clears its pending entry so it can be retried.
+const catalogFlight = createSingleFlight<Awaited<ReturnType<typeof queryCatalog>>>();
+const metaFlight = createSingleFlight<Awaited<ReturnType<typeof queryResourceMeta>>>();
 
 // Per-filter-combination catalog response cache (#316). Keyed by a normalized
 // filter/sort/pagination key so identical queries skip the filter/sort/paginate
@@ -259,6 +266,12 @@ export type CatalogListFilters = {
   search?: string;
   resourceType?: "file" | "link";
   owner?: string;
+  /**
+   * Tag filter (#222). Matching is exact (case-insensitive) and multiple tags
+   * are combined with AND semantics: a resource must carry every requested tag.
+   * Duplicates are ignored; the caller validates the count limit.
+   */
+  tags?: string[];
   sort?: CatalogSort;
   limit?: number;
   offset?: number;
@@ -329,6 +342,7 @@ async function queryCatalog() {
       mimeType: resources.mimeType,
       thumbnailPath: resources.thumbnailPath,
       verificationStatus: resources.verificationStatus,
+      tags: resources.tags,
       publisherName: publishers.name,
       walletAddress: resources.walletAddress,
       createdAt: resources.createdAt,
@@ -346,9 +360,13 @@ async function getCachedCatalogRows(): Promise<Awaited<ReturnType<typeof queryCa
   if (cached !== undefined) {
     return cached as Awaited<ReturnType<typeof queryCatalog>>;
   }
-  const rows = await queryCatalog();
-  readCache.set(CATALOG_KEY, rows);
-  return rows;
+  // Single-flight (#225): a cold/expired catalog key triggers one query even
+  // when many requests arrive concurrently.
+  return catalogFlight.load(CATALOG_KEY, async () => {
+    const rows = await queryCatalog();
+    readCache.set(CATALOG_KEY, rows);
+    return rows;
+  });
 }
 
 function applyCatalogFilters<
@@ -360,12 +378,18 @@ function applyCatalogFilters<
     resourceType: string;
     publisherName: string;
     walletAddress: string;
+    tags?: string[] | null;
   },
 >(rows: T[], filters?: CatalogListFilters): T[] {
   if (!filters) return rows;
 
   const search = filters.search?.toLowerCase();
   const owner = filters.owner?.toLowerCase();
+  // Exact, case-insensitive tag matching with AND semantics (#222): every
+  // requested tag must be present on the row.
+  const requiredTags = filters.tags?.length
+    ? [...new Set(filters.tags.map((t) => t.trim().toLowerCase()).filter((t) => t.length > 0))]
+    : [];
   // Prices are stored as decimal strings (e.g. "0.50"); compare numerically and
   // inclusively, parsing only at the point of comparison.
   const min = filters.minPrice !== undefined ? parseFloat(filters.minPrice) : undefined;
@@ -384,6 +408,10 @@ function applyCatalogFilters<
       return false;
     }
     if (filters.resourceType && r.resourceType !== filters.resourceType) return false;
+    if (requiredTags.length > 0) {
+      const rowTags = new Set((r.tags ?? []).map((t) => t.toLowerCase()));
+      if (!requiredTags.every((t) => rowTags.has(t))) return false;
+    }
     if (
       owner &&
       !(
@@ -415,6 +443,11 @@ function catalogCacheKey(kind: "list" | "count", filters?: CatalogListFilters): 
   if (filters.owner) {
     const o = filters.owner.trim().toLowerCase();
     if (o) norm.owner = o;
+  }
+  if (filters.tags?.length) {
+    // Sorted + lowercased so tag order never splits the cache (#222).
+    const tags = [...new Set(filters.tags.map((t) => t.trim().toLowerCase()).filter((t) => t.length > 0))].sort();
+    if (tags.length) norm.tags = tags.join(",");
   }
   if (filters.sort) norm.sort = filters.sort;
   // Count ignores pagination (#162), so omit limit/offset from the count key so
@@ -483,6 +516,7 @@ async function queryResourceMeta(id: string) {
       resourceType: resources.resourceType,
       mimeType: resources.mimeType,
       verificationStatus: resources.verificationStatus,
+      tags: resources.tags,
       publisherName: publishers.name,
       publisherWallet: resources.walletAddress,
       thumbnailPath: resources.thumbnailPath,
@@ -497,17 +531,59 @@ async function queryResourceMeta(id: string) {
     .then((rows) => rows[0] ?? null);
 }
 
+type ResourceMeta = NonNullable<Awaited<ReturnType<typeof queryResourceMeta>>>;
+
+/**
+ * Deterministic validator for public resource metadata (#223). Hashes the
+ * fields exposed by the public metadata read so any metadata change yields a
+ * new ETag. Private/owner-only responses must not reuse this value.
+ */
+export function computeResourceEtag(meta: ResourceMeta): string {
+  const createdAt =
+    meta.createdAt instanceof Date ? meta.createdAt.toISOString() : String(meta.createdAt);
+  const payload = JSON.stringify([
+    meta.id,
+    meta.title,
+    meta.description ?? null,
+    meta.price,
+    meta.resourceType,
+    meta.mimeType ?? null,
+    meta.verificationStatus,
+    meta.thumbnailPath ?? null,
+    meta.onchainStatus ?? null,
+    meta.contentHash ?? null,
+    createdAt,
+  ]);
+  return `"${createHash("sha256").update(payload).digest("hex")}"`;
+}
+
 export async function getResourceMeta(
   id: string,
 ): Promise<Awaited<ReturnType<typeof queryResourceMeta>>> {
   const cached = readCache.get(metaKey(id));
   if (cached !== undefined) return cached as Awaited<ReturnType<typeof queryResourceMeta>>;
 
-  const result = await queryResourceMeta(id);
-  // Only cache hits; a 404 (null) stays uncached so a freshly created resource
-  // becomes visible immediately.
-  if (result) readCache.set(metaKey(id), result);
-  return result;
+  // Single-flight (#225): concurrent misses for one id share a single query.
+  return metaFlight.load(metaKey(id), async () => {
+    const result = await queryResourceMeta(id);
+    // Only cache hits; a 404 (null) stays uncached so a freshly created resource
+    // becomes visible immediately.
+    if (result) readCache.set(metaKey(id), result);
+    return result;
+  });
+}
+
+/**
+ * Public metadata read with its stable ETag (#223). Returns null when the
+ * resource does not exist. Callers compare the ETag against `If-None-Match`
+ * and answer 304 when it matches.
+ */
+export async function getResourceMetaWithEtag(
+  id: string,
+): Promise<{ meta: ResourceMeta; etag: string } | null> {
+  const meta = await getResourceMeta(id);
+  if (!meta) return null;
+  return { meta, etag: computeResourceEtag(meta) };
 }
 
 /**

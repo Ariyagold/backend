@@ -110,10 +110,23 @@ function parseDateParam(value: unknown, name: string): Date | undefined {
   return parsed;
 }
 
+/** Parse a strict positive-integer query param; throws VALIDATION_ERROR when invalid. */
+function parsePositiveIntParam(value: unknown, name: string, max: number, fallback: number): number {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value !== "string" || !/^\d+$/.test(value)) {
+    throw new AppError("VALIDATION_ERROR", `Invalid ${name}: expected an integer 1-${max}`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > max) {
+    throw new AppError("VALIDATION_ERROR", `Invalid ${name}: expected an integer 1-${max}`);
+  }
+  return parsed;
+}
+
 /** GET /admin/audit */
 router.get("/admin/audit", adminAuth, async (req, res) => {
-  const limit = Math.min(Math.max(Math.trunc(Number(req.query.limit)) || 50, 1), 200);
-  const page  = Math.max(Math.trunc(Number(req.query.page)) || 1, 1);
+  const limit = parsePositiveIntParam(req.query.limit, "limit", 200, 50);
+  const page  = parsePositiveIntParam(req.query.page, "page", Number.MAX_SAFE_INTEGER, 1);
   const offset = (page - 1) * limit;
 
   const resourceId = typeof req.query.resourceId === "string" && req.query.resourceId !== ""
@@ -124,6 +137,9 @@ router.get("/admin/audit", adminAuth, async (req, res) => {
     : undefined;
   const from = parseDateParam(req.query.from, "from");
   const to = parseDateParam(req.query.to, "to");
+  if (from !== undefined && to !== undefined && from.getTime() > to.getTime()) {
+    throw new AppError("VALIDATION_ERROR", "Invalid date range: 'from' must not be after 'to'");
+  }
 
   const conditions: SQL[] = [];
   if (resourceId !== undefined) conditions.push(eq(payments.resourceId, resourceId));
@@ -136,7 +152,7 @@ router.get("/admin/audit", adminAuth, async (req, res) => {
               payer: payments.payerAddress, amount: payments.amount, paidAt: payments.paidAt })
     .from(payments)
     .where(conditions.length > 0 ? and(...conditions) : undefined)
-    .orderBy(desc(payments.paidAt))
+    .orderBy(desc(payments.paidAt), desc(payments.id))
     .limit(limit)
     .offset(offset);
 
