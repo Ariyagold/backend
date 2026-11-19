@@ -263,8 +263,21 @@ export const payments = pgTable(
     // earnings (#99).
     status: paymentStatusEnum("status").notNull().default("pending"),
     paidAt: timestamp("paid_at", { withTimezone: true }).defaultNow().notNull(),
+    // Stable settlement identity: sha256 of the x402 payment authorization
+    // header (covers v1/v2 payloads). Unique so replays/retries can't count
+    // one settlement twice (#192). Null for legacy rows.
+    settlementKey: text("settlement_key"),
+    // Chain transaction / facilitator reference of the settlement (#190).
+    settlementTxHash: text("settlement_tx_hash"),
+    settlementNetwork: text("settlement_network"),
+    // Failure classification only; never payment authorization material (#190).
+    settlementFailureReason: text("settlement_failure_reason"),
+    settledAt: timestamp("settled_at", { withTimezone: true }),
   },
   (table) => ({
+    settlementKeyUnique: uniqueIndex("uq_payments_settlement_key").on(table.settlementKey),
+    // Reconciliation scans pending rows by age (#191).
+    pendingIdx: index("idx_payments_pending_paid_at").on(table.paidAt).where(sql`${table.status} = 'pending'`),
     // Payment history is queried per payer wallet (#285).
     payerAddressIdx: index("idx_payments_payer_address").on(table.payerAddress),
     // Publisher analytics aggregate per resource (#100), and analytics and

@@ -18,7 +18,7 @@ import { validate } from "../middleware/validate.js";
 import { verifyContentSchema } from "../schemas/requests.js";
 import { hashFileResource, hashLinkResource } from "../utils/crypto.js";
 import { parsePayerFromXPayment } from "../lib/parseXPayment.js";
-import { recordSettlementOnFinish } from "../lib/paymentSettlement.js";
+import { recordSettlementOnFinish, settlementKeyFromHeader } from "../lib/paymentSettlement.js";
 
 const router: RouterType = Router();
 
@@ -177,7 +177,9 @@ router.post(
             payerAddress: payer ?? "unknown",
             recipientAddress: config.PAY_TO,
             amount: config.VERIFICATION_PRICE,
+            settlementKey: settlementKeyFromHeader(paymentHeader),
           })
+          .onConflictDoNothing({ target: payments.settlementKey })
           .returning({ id: payments.id });
 
         // Update resource status — listing is independent of on-chain registration.
@@ -203,7 +205,8 @@ router.post(
         return { payment, updated };
       });
 
-      recordSettlementOnFinish(res, payment.id);
+      // A replayed authorization conflicts on the settlement key: no second row.
+      if (payment) recordSettlementOnFinish(res, payment.id);
 
       if (updated && shouldList) {
         void enqueueWebhookEvent(updated.publisherId, "resource.listed", {

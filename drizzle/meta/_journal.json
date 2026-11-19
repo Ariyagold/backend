@@ -204,6 +204,13 @@
       "when": 1795039900000,
       "tag": "0024_pending_cleanup_retry_schedule",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1795040000000,
+      "tag": "0025_payment_settlement_reference",
+      "breakpoints": true
     }
   ]
 }
