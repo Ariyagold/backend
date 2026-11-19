@@ -15,6 +15,7 @@ const mockConfig = vi.hoisted(() => ({
   SIGNING_SECRET_KEY: undefined as string | undefined,
   REDIS_URL: "redis://shared:6379" as string | undefined,
   REPLAY_REDIS_CONNECT_TIMEOUT_MS: 500,
+  REPLAY_PROTECTION_FAILURE_MODE: "closed" as "closed" | "open",
 }));
 
 /** One Redis server shared by every replica. */
@@ -95,9 +96,11 @@ async function bootReplica(): Promise<Middleware> {
 }
 
 const path = "/resources/res-1/register";
-const rawBody = JSON.stringify({ signedXdr: "AAAA" });
+let nonce = 0;
 
+/** A freshly signed request; each call yields a distinct signature. */
 function signedRequest(): Request {
+  const rawBody = JSON.stringify({ signedXdr: `AAAA${nonce++}` });
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const signature = signPublisherRequest({
     secret: TEST_SIGNING_SECRET,
@@ -134,7 +137,17 @@ beforeEach(() => {
   fakeRedis.state.connects = 0;
   mockConfig.REDIS_URL = "redis://shared:6379";
   mockConfig.REPLAY_REDIS_CONNECT_TIMEOUT_MS = 500;
+  mockConfig.REPLAY_PROTECTION_FAILURE_MODE = "closed";
 });
+
+/** Simulate Redis going away: commands fail, connections drop, reconnects refused. */
+function redisOutage() {
+  fakeRedis.state.down = true;
+  for (const c of fakeRedis.clients) {
+    c.isOpen = false;
+    c.isReady = false;
+  }
+}
 
 describe("replay protection — Redis cold start", () => {
   it("awaits Redis init so two cold replicas allow at most one mutation per signature", async () => {
@@ -156,14 +169,16 @@ describe("replay protection — Redis cold start", () => {
     expect(fakeRedis.state.connects).toBe(1);
   });
 
-  it("bounds the wait for Redis initialization", async () => {
+  it("bounds the wait for Redis initialization (and fails closed past it)", async () => {
     fakeRedis.state.connectDelayMs = 5_000;
     mockConfig.REPLAY_REDIS_CONNECT_TIMEOUT_MS = 50;
     const replica = await bootReplica();
 
     const started = Date.now();
-    await run(replica, signedRequest());
+    const result = await run(replica, signedRequest());
     expect(Date.now() - started).toBeLessThan(1_000);
+    expect(result.allowed).toBe(false);
+    expect(result.err).toMatchObject({ status: 503, code: "SERVICE_UNAVAILABLE" });
   });
 
   it("uses only the in-process cache when REDIS_URL is unset", async () => {
@@ -174,5 +189,69 @@ describe("replay protection — Redis cold start", () => {
     expect((await run(replica, req)).allowed).toBe(true);
     expect((await run(replica, cloneRequest(req))).allowed).toBe(false);
     expect(fakeRedis.state.connects).toBe(0);
+  });
+});
+
+describe("replay protection — Redis outage policy", () => {
+  it("fail-closed: rejects on both replicas during an outage, then recovers with shared guarantees", async () => {
+    const replicaA = await bootReplica();
+    const replicaB = await bootReplica();
+
+    // Healthy: both replicas connected and enforcing via Redis.
+    expect((await run(replicaA, signedRequest())).allowed).toBe(true);
+    expect((await run(replicaB, signedRequest())).allowed).toBe(true);
+
+    // Outage: the same signature sent to both replicas — neither may mutate.
+    redisOutage();
+    const duringOutage = signedRequest();
+    const outage = await Promise.all([
+      run(replicaA, duringOutage),
+      run(replicaB, cloneRequest(duringOutage)),
+    ]);
+    for (const r of outage) {
+      expect(r.allowed).toBe(false);
+      expect(r.err).toMatchObject({ status: 503, code: "SERVICE_UNAVAILABLE" });
+    }
+
+    // Recovery: replicas reconnect on the next request; the signature that was
+    // rejected (never consumed) is now accepted exactly once across both.
+    fakeRedis.state.down = false;
+    const afterRecovery = await Promise.all([
+      run(replicaA, duringOutage),
+      run(replicaB, cloneRequest(duringOutage)),
+    ]);
+    expect(afterRecovery.filter((r) => r.allowed)).toHaveLength(1);
+    expect(afterRecovery.find((r) => !r.allowed)?.err?.message).toBe("Request signature already used");
+  });
+
+  it("fail-closed: rejects when a Redis command fails on a seemingly ready client", async () => {
+    const replica = await bootReplica();
+    expect((await run(replica, signedRequest())).allowed).toBe(true);
+
+    fakeRedis.state.down = true; // client still reports ready; SET throws
+    const result = await run(replica, signedRequest());
+    expect(result.err).toMatchObject({ status: 503, code: "SERVICE_UNAVAILABLE" });
+  });
+
+  it("fail-open: stays available but cannot stop a cross-replica replay during the outage", async () => {
+    mockConfig.REPLAY_PROTECTION_FAILURE_MODE = "open";
+    const replicaA = await bootReplica();
+    const replicaB = await bootReplica();
+    await run(replicaA, signedRequest());
+    await run(replicaB, signedRequest());
+
+    redisOutage();
+    const req = signedRequest();
+    const results = await Promise.all([run(replicaA, req), run(replicaB, cloneRequest(req))]);
+    // Documented tradeoff: each replica's local cache accepts the signature once.
+    expect(results.every((r) => r.allowed)).toBe(true);
+    // Same replica still rejects the replay locally.
+    expect((await run(replicaA, cloneRequest(req))).allowed).toBe(false);
+
+    // After recovery the shared guarantee is restored.
+    fakeRedis.state.down = false;
+    const fresh = signedRequest();
+    const recovered = await Promise.all([run(replicaA, fresh), run(replicaB, cloneRequest(fresh))]);
+    expect(recovered.filter((r) => r.allowed)).toHaveLength(1);
   });
 });

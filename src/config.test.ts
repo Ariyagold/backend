@@ -464,3 +464,28 @@ describe('applyNetworkEnvDefaults behaviors', () => {
     expect(config.REGISTRY_CONTRACT_ID).toBe(VALID_CONTRACT_ID);
   });
 });
+describe('replay protection failure policy', () => {
+  it('defaults to fail-open outside production and validates the enum', async () => {
+    setEnv(baseValidEnv());
+    const { config } = await loadConfig();
+    expect(config.REPLAY_PROTECTION_FAILURE_MODE).toBe('open');
+    expect(config.REPLAY_REDIS_CONNECT_TIMEOUT_MS).toBe(2000);
+
+    expect(envSchema.shape.REPLAY_PROTECTION_FAILURE_MODE.safeParse('closed').success).toBe(true);
+    expect(envSchema.shape.REPLAY_PROTECTION_FAILURE_MODE.safeParse('maybe').success).toBe(false);
+  });
+
+  it('warns in production when shared replay guarantees can be lost', async () => {
+    setEnv(baseValidEnv());
+    const { replayProtectionWarnings } = await loadConfig();
+    const prod = { NODE_ENV: 'production', REQUIRE_REQUEST_SIGNATURE: true };
+
+    expect(replayProtectionWarnings({ ...prod, REDIS_URL: 'redis://r:6379', REPLAY_PROTECTION_FAILURE_MODE: 'closed' })).toEqual([]);
+    expect(replayProtectionWarnings({ ...prod, REDIS_URL: 'redis://r:6379', REPLAY_PROTECTION_FAILURE_MODE: 'open' })[0])
+      .toMatch(/REPLAY_PROTECTION_FAILURE_MODE=open/);
+    expect(replayProtectionWarnings({ ...prod, REPLAY_PROTECTION_FAILURE_MODE: 'closed' })[0])
+      .toMatch(/REDIS_URL is not set/);
+    expect(replayProtectionWarnings({ NODE_ENV: 'development', REQUIRE_REQUEST_SIGNATURE: true, REPLAY_PROTECTION_FAILURE_MODE: 'open' }))
+      .toEqual([]);
+  });
+});
