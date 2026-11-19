@@ -51,7 +51,7 @@
     "@opentelemetry/instrumentation-express": "^0.57.0",
     "@opentelemetry/instrumentation-http": "^0.217.0",
     "@opentelemetry/instrumentation-undici": "^0.21.0",
-    "@opentelemetry/resources": "^2.8.0",
+    "@opentelemetry/resources": "^2.12.1",
     "@opentelemetry/sdk-node": "^0.217.0",
     "@opentelemetry/semantic-conventions": "^1.28.0",
     "@paralleldrive/cuid2": "^3.3.0",
