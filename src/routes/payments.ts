@@ -1,9 +1,12 @@
 import { Router, type Router as RouterType } from "express";
-import { eq, desc } from "drizzle-orm";
+import { eq, and, desc } from "drizzle-orm";
 import { Keypair } from "@stellar/stellar-sdk";
 import { db } from "../db/client.js";
 import { payments, publishers } from "../db/schema.js";
 import { AppError } from "../lib/errors.js";
+import { getResourceById } from "../services/resourceService.js";
+import { downloadFile } from "../storage/supabaseStorage.js";
+import { attachmentDisposition } from "../lib/contentDisposition.js";
 import { hashApiKey } from "../utils/crypto.js";
 import { toReceiptTerms } from "../lib/purchaseSnapshot.js";
 
@@ -75,12 +78,8 @@ router.get("/payments/:id/receipt", noStore, async (req, res) => {
       payerAddress: payments.payerAddress,
       recipientAddress: payments.recipientAddress,
       paidAt: payments.paidAt,
-      receiptVersion: payments.receiptVersion,
-      network: payments.network,
-      asset: payments.asset,
-      resourceTitle: payments.resourceTitle,
-      resourceType: payments.resourceType,
-      resourceContentHash: payments.resourceContentHash,
+      status: payments.status,
+      deliveryStatus: payments.deliveryStatus,
     })
     .from(payments)
     .where(eq(payments.id, id))
@@ -105,6 +104,63 @@ router.get("/payments/:id/receipt", noStore, async (req, res) => {
     ...base,
     terms: toReceiptTerms({ receiptVersion, network, asset, resourceTitle, resourceType, resourceContentHash }),
   });
+});
+
+// GET /payments/:id/recover — payer-authenticated re-delivery of a settled but
+// undelivered purchase. Never creates or settles a payment (#195).
+router.get("/payments/:id/recover", async (req, res) => {
+  const walletAddressHeader = req.headers["x-wallet-address"];
+  const walletAddress = typeof walletAddressHeader === "string" ? walletAddressHeader : undefined;
+  if (!walletAddress || !verifyWalletSignature(req, walletAddress)) {
+    throw new AppError("UNAUTHORIZED", "Valid wallet signature required");
+  }
+
+  const payment = await db
+    .select()
+    .from(payments)
+    .where(eq(payments.id, req.params.id as string))
+    .then((rows) => rows[0] ?? null);
+  if (!payment || payment.payerAddress !== walletAddress) {
+    throw new AppError("NOT_FOUND", "Receipt not found");
+  }
+  if (payment.status !== "settled" || payment.verificationId || payment.deliveryStatus === "delivered") {
+    throw new AppError("CONFLICT", "Purchase is not eligible for recovery");
+  }
+
+  const resource = await getResourceById(payment.resourceId);
+  if (!resource || resource.id !== payment.resourceId) {
+    throw new AppError("NOT_FOUND", "Resource not found");
+  }
+
+  if (resource.resourceType === "link") {
+    await db.update(payments).set({ deliveryStatus: "delivered" }).where(eq(payments.id, payment.id));
+    res.json({ url: resource.externalUrl, paymentId: payment.id });
+    return;
+  }
+  if (!resource.storagePath) {
+    throw new AppError("INTERNAL_ERROR", "Resource file not found");
+  }
+
+  let file: Awaited<ReturnType<typeof downloadFile>>;
+  try {
+    file = await downloadFile(resource.storagePath);
+  } catch (err) {
+    throw new AppError("UPSTREAM_ERROR", "Failed to deliver resource content", undefined, { cause: err });
+  }
+  res.once("close", () => {
+    if (res.writableFinished) {
+      void db
+        .update(payments)
+        .set({ deliveryStatus: "delivered" })
+        .where(and(eq(payments.id, payment.id), eq(payments.status, "settled")))
+        .catch(() => undefined);
+    }
+  });
+  res.setHeader("X-Payment-Id", payment.id);
+  res.setHeader("Content-Type", file.mimeType);
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Content-Disposition", attachmentDisposition(resource.storagePath.split("/").pop() ?? ""));
+  res.send(file.buffer);
 });
 
 // GET /buyers/:address/payments — buyer payment history

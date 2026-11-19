@@ -58,8 +58,7 @@ import {
   type ExpectedSignedTx,
 } from "../services/registryClient.js";
 import { parsePayerFromXPayment } from "../lib/parseXPayment.js";
-import { buildPurchaseSnapshot, RECEIPT_ASSET_CODE, toReceiptTerms } from "../lib/purchaseSnapshot.js";
-import { recordSettlementOnFinish } from "../lib/paymentSettlement.js";
+import { recordSettlementOnFinish, recordDeliveryOnClose } from "../lib/paymentSettlement.js";
 import { AppError, isAppError } from "../lib/errors.js";
 import { emitToPublisher, enqueueWebhookEvent } from "../services/webhookService.js";
 
@@ -382,7 +381,7 @@ router.get("/resources/:id", dynamicPaywall, async (req, res) => {
 
   // Records a payment row with an explicit delivery status so an undelivered
   // purchase can be reconciled later (#86).
-  const recordPayment = async (deliveryStatus: "delivered" | "undelivered") => {
+  const recordPayment = async (deliveryStatus: "delivered" | "undelivered" | "pending") => {
     const [payment] = await db
       .insert(payments)
       .values({
@@ -461,7 +460,8 @@ router.get("/resources/:id", dynamicPaywall, async (req, res) => {
     });
   }
 
-  const payment = await recordPayment("delivered");
+  const payment = await recordPayment("pending");
+  recordDeliveryOnClose(res, payment.id);
   emitPurchase(payment);
 
   // Add receipt info in headers for file downloads
