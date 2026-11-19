@@ -1,1 +1,1 @@
-CREATE INDEX IF NOT EXISTS "idx_resources_catalog_filter_sort" ON "resources" ("listed","verification_status","created_at");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "idx_resources_tags_gin" ON "resources" USING gin ("tags");--> statement-breakpoint
