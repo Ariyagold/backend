@@ -10,7 +10,7 @@ import { resources, publishers, payments } from "../db/schema.js";
 import { desc, asc, count, and, or, eq, ne, gte, lte, inArray, sql, type SQL } from "drizzle-orm";
 import { getLogger } from "../lib/logger.js";
 import { AppError } from "../lib/errors.js";
-import { adminDelistResource } from "../services/resourceService.js";
+import { adminDelistResource, listVerificationReviewQueue, resolveVerificationReview } from "../services/resourceService.js";
 import { config } from "../config.js";
 
 const router = Router();
@@ -60,6 +60,41 @@ router.post("/admin/delist/:id", adminAuth, async (req, res) => {
   }
   getLogger().warn({ resourceId: id, event: "admin_delist", actor, reason }, "resource delisted by admin");
   res.json({ success: true, id, delistedAt: new Date().toISOString() });
+});
+
+function adminActor(req: Request): string {
+  const rawKey = req.headers["x-admin-key"] as string;
+  return `admin:${createHash("sha256").update(rawKey).digest("hex").slice(0, 12)}`;
+}
+
+/** GET /admin/verification-reviews — queue of low-confidence holds (#188) */
+router.get("/admin/verification-reviews", adminAuth, async (req, res) => {
+  const limit = Math.min(Math.max(Math.trunc(Number(req.query.limit)) || 50, 1), 200);
+  const page = Math.max(Math.trunc(Number(req.query.page)) || 1, 1);
+  const entries = await listVerificationReviewQueue(limit, (page - 1) * limit);
+  res.json({ page, limit, entries });
+});
+
+/** POST /admin/verification-reviews/:id/resolve — body { decision, reason } (#188) */
+router.post("/admin/verification-reviews/:id/resolve", adminAuth, async (req, res) => {
+  const id = req.params.id as string;
+  const decision = req.body?.decision;
+  const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+  if (decision !== "approve" && decision !== "reject") {
+    throw new AppError("VALIDATION_ERROR", "decision must be 'approve' or 'reject'");
+  }
+  if (!reason) throw new AppError("VALIDATION_ERROR", "reason is required");
+  const actor = adminActor(req);
+  const result = await resolveVerificationReview(id, { decision, reason, actor });
+  if (!result.ok) {
+    if (result.error === "not_found") throw new AppError("NOT_FOUND", "Resource not found");
+    if (result.error === "delisted") {
+      throw new AppError("FORBIDDEN", "Resource was delisted by an administrator and cannot be relisted");
+    }
+    throw new AppError("CONFLICT", "Resource is not awaiting verification review");
+  }
+  getLogger().info({ resourceId: id, event: "verification_review_resolved", actor, decision, reason }, "verification review resolved");
+  res.json({ success: true, id, status: result.status });
 });
 
 /** Parse an optional ISO date query param; throws VALIDATION_ERROR when invalid. */

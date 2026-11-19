@@ -209,14 +209,7 @@
       "idx": 29,
       "version": "7",
       "when": 1795040000000,
-      "tag": "0025_payment_purchase_snapshot",
-      "breakpoints": true
-    },
-    {
-      "idx": 30,
-      "version": "7",
-      "when": 1795040100000,
-      "tag": "0026_payment_exception_indexes",
+      "tag": "0025_verification_review",
       "breakpoints": true
     }
   ]

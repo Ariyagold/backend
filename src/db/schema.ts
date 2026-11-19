@@ -27,6 +27,8 @@ export const verificationStatusEnum = pgEnum("verification_status", [
   "verified",
   "rejected",
   "skipped",
+  // Held for a human admin decision (low confidence / injection hold) (#188).
+  "review_required",
 ]);
 
 export const onchainStatusEnum = pgEnum("onchain_status_enum", [
@@ -215,6 +217,8 @@ export const verifications = pgTable(
     completionTokens: integer("completion_tokens"),
     totalTokens: integer("total_tokens"),
     estimatedCost: text("estimated_cost"), // USD, stringified for precision
+    // Review-input contract the verdict was produced under (#189); null on legacy rows.
+    inputContractVersion: text("input_contract_version"),
     checkedAt: timestamp("checked_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({

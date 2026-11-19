@@ -1,4 +1,4 @@
-import { eq, and, desc, isNull } from "drizzle-orm";
+import { eq, and, desc, asc, isNull } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { resources, publishers, verifications, moderationEvents } from "../db/schema.js";
 import { uploadFile, deleteFile } from "../storage/supabaseStorage.js";
@@ -66,6 +66,75 @@ export async function adminDelistResource(
 
   invalidateReads(resource.id);
   return resource;
+}
+
+/** Resources held for manual verification review, oldest first (#188). */
+export async function listVerificationReviewQueue(limit = 50, offset = 0) {
+  return db
+    .select({
+      id: resources.id,
+      title: resources.title,
+      publisherId: resources.publisherId,
+      verificationId: resources.verificationId,
+      createdAt: resources.createdAt,
+    })
+    .from(resources)
+    .where(and(eq(resources.verificationStatus, "review_required"), isNull(resources.adminDelistedAt)))
+    .orderBy(asc(resources.createdAt))
+    .limit(limit)
+    .offset(offset);
+}
+
+export type ReviewResolution =
+  | { ok: true; id: string; status: "verified" | "rejected" }
+  | { ok: false; error: "not_found" | "delisted" | "not_in_review" };
+
+/**
+ * Resolve a held verification (#188). Records decision + reason + actor in
+ * moderation_events in the same transaction. Admin-delisted resources can
+ * never be relisted by an approval.
+ */
+export async function resolveVerificationReview(
+  id: string,
+  input: { decision: "approve" | "reject"; reason: string; actor: string },
+): Promise<ReviewResolution> {
+  const result = await db.transaction(async (tx): Promise<ReviewResolution> => {
+    const [current] = await tx
+      .select({
+        status: resources.verificationStatus,
+        adminDelistedAt: resources.adminDelistedAt,
+      })
+      .from(resources)
+      .where(eq(resources.id, id))
+      .limit(1);
+    if (!current) return { ok: false, error: "not_found" };
+    if (current.adminDelistedAt) return { ok: false, error: "delisted" };
+    if (current.status !== "review_required") return { ok: false, error: "not_in_review" };
+
+    const approve = input.decision === "approve";
+    const [updated] = await tx
+      .update(resources)
+      .set({ verificationStatus: approve ? "verified" : "rejected", listed: approve })
+      .where(
+        and(
+          eq(resources.id, id),
+          eq(resources.verificationStatus, "review_required"),
+          isNull(resources.adminDelistedAt),
+        ),
+      )
+      .returning({ id: resources.id });
+    if (!updated) return { ok: false, error: "not_in_review" };
+
+    await tx.insert(moderationEvents).values({
+      resourceId: id,
+      action: approve ? "verification_review_approve" : "verification_review_reject",
+      reason: input.reason,
+      actor: input.actor,
+    });
+    return { ok: true, id, status: approve ? "verified" : "rejected" };
+  });
+  if (result.ok) invalidateReads(id);
+  return result;
 }
 
 /** Test helper — clear the read caches between cases. */

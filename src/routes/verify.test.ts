@@ -254,7 +254,7 @@ describe("POST /verify-content — AI content verification endpoint", () => {
         usage: mockUsage,
         deterministicPassed: true,
       });
-      expect(h.checkOriginality).toHaveBeenCalledWith(DOC_TEXT, "text");
+      expect(h.checkOriginality).toHaveBeenCalledWith(DOC_TEXT, "text", expect.objectContaining({ signal: expect.anything() }));
     });
 
     it("returns verification result for rejected content", async () => {
@@ -282,19 +282,21 @@ describe("POST /verify-content — AI content verification endpoint", () => {
       expect(h.update).not.toHaveBeenCalled();
     });
 
-    it("handles verification service errors gracefully", async () => {
-      h.checkOriginality.mockResolvedValue({
-        isOriginal: false,
-        confidence: 0,
-        flags: ["No response from verification model"],
-        usage: mockUsage,
-      });
+    it("returns a retryable 503 on provider failure and persists nothing (#187)", async () => {
+      h.resourceRows = [fileRow()];
+      h.checkOriginality.mockRejectedValue(
+        Object.assign(new Error("empty"), { name: "VerificationProviderError", reason: "empty_response" }),
+      );
 
-      const res = await request(createTestApp()).post("/verify-content").send({ content: "test content" });
+      const res = await request(createTestApp())
+        .post("/verify-content")
+        .set("x-api-key", "key-pub-1")
+        .send({ content: DOC_TEXT, resourceId: "res-1" });
 
-      expect(res.status).toBe(200);
-      expect(res.body.isOriginal).toBe(false);
-      expect(res.body.confidence).toBe(0);
+      expect(res.status).toBe(503);
+      expect(res.body.details).toMatchObject({ retryable: true });
+      expect(h.insert).not.toHaveBeenCalled();
+      expect(h.update).not.toHaveBeenCalled();
     });
   });
 
@@ -441,6 +443,24 @@ describe("POST /verify-content — AI content verification endpoint", () => {
 
       expect(res.status).toBe(200);
       expect(h.setValues).toHaveBeenCalledWith(expect.objectContaining({ listed: true }));
+      // The review input for a link is its URL, typed as "link" (#189).
+      expect(h.checkOriginality).toHaveBeenCalledWith(LINK_URL, "link", expect.anything());
+    });
+
+    it("reviews file content typed as \"file\" and holds low-confidence results for review (#188, #189)", async () => {
+      h.resourceRows = [fileRow()];
+      h.checkOriginality.mockResolvedValue({ ...rejected(), needsReview: true });
+
+      const res = await request(createTestApp())
+        .post("/verify-content")
+        .set("x-api-key", "key-pub-1")
+        .send({ content: DOC_TEXT, resourceId: "res-1" });
+
+      expect(res.status).toBe(200);
+      expect(h.checkOriginality).toHaveBeenCalledWith(DOC_TEXT, "file", expect.anything());
+      expect(h.setValues).toHaveBeenCalledWith(
+        expect.objectContaining({ verificationStatus: "review_required", listed: false }),
+      );
     });
 
     it("rejects a link resource when the content is not its URL", async () => {

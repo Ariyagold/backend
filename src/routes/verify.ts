@@ -10,6 +10,7 @@ import { enqueueWebhookEvent } from "../services/webhookService.js";
 import { config } from "../config.js";
 import { buildPurchaseSnapshot } from "../lib/purchaseSnapshot.js";
 import { AppError } from "../lib/errors.js";
+import { INPUT_CONTRACT_VERSION, type ReviewResourceType } from "../lib/verificationContract.js";
 import { getLogger } from "../lib/logger.js";
 import { businessEventsTotal, verificationCostUsd } from "../lib/metrics.js";
 import { network, sharedX402ResourceServer } from "../lib/x402.js";
@@ -70,7 +71,7 @@ function contentMatchesResource(
  * charged. Checks that the resource belongs to the caller, has not been
  * delisted by an admin, and that `content` hashes to the stored content_hash.
  */
-async function checkResourceForVerification(req: Request, _res: Response, next: NextFunction) {
+async function checkResourceForVerification(req: Request, res: Response, next: NextFunction) {
   const { resourceId, content } = req.body ?? {};
   if (!resourceId) return next();
 
@@ -100,6 +101,8 @@ async function checkResourceForVerification(req: Request, _res: Response, next: 
   if (typeof content === "string" && !contentMatchesResource(content, resource)) {
     throw new AppError("CONFLICT", "Content does not match the resource's stored content");
   }
+  // The review input is the stored content as its resource type (#189).
+  res.locals.reviewResourceType = resource.resourceType;
   next();
 }
 
@@ -119,7 +122,40 @@ router.post(
   async (req, res) => {
     const { content, resourceId } = req.body;
 
-    const result = await checkOriginality(content, "text");
+    // Cancellation policy (#184): if the client disconnects or the response
+    // closes before we finish, the model call is aborted and NOTHING is
+    // persisted (no verification row, no fee record, no resource change). The
+    // x402 fee is only settled for a successful (<400) response, so a
+    // canceled request is not charged.
+    const abort = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) abort.abort();
+    });
+
+    const reviewType: ReviewResourceType = res.locals.reviewResourceType ?? "text";
+    let result;
+    try {
+      result = await checkOriginality(content, reviewType, {
+        signal: abort.signal,
+        timeoutMs: config.VERIFICATION_TIMEOUT_MS,
+      });
+    } catch (err) {
+      const name = (err as Error)?.name;
+      if (name === "VerificationCanceledError" || abort.signal.aborted) return;
+      if (name === "VerificationProviderError") {
+        // Outage/protocol failure (#187): retryable, never a content verdict.
+        // Nothing is written, so an existing valid verdict is not overwritten,
+        // and the 503 means the x402 payment is not settled (no fee).
+        businessEventsTotal.inc({ event: "verification.completed", outcome: "provider_failure" });
+        res.setHeader("Retry-After", "30");
+        throw new AppError("SERVICE_UNAVAILABLE", "Verification provider unavailable; retry later", {
+          retryable: true,
+          reason: (err as { reason?: string }).reason,
+        });
+      }
+      throw err;
+    }
+    if (abort.signal.aborted) return;
     const { usage } = result;
 
     // Record business metrics for the completed verification.
@@ -162,6 +198,7 @@ router.post(
           .values({
             resourceId,
             isOriginal: result.isOriginal,
+            inputContractVersion: INPUT_CONTRACT_VERSION,
             confidence: result.confidence,
             flags: JSON.stringify(result.flags),
             promptTokens: usage.promptTokens,
@@ -192,7 +229,11 @@ router.post(
         const [updated] = await tx
           .update(resources)
           .set({
-            verificationStatus: shouldList ? "verified" : "rejected",
+            verificationStatus: shouldList
+              ? "verified"
+              : result.needsReview
+                ? "review_required"
+                : "rejected",
             verificationId: verification.id,
             listed: shouldList,
           })
