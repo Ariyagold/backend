@@ -390,6 +390,9 @@ router.get("/resources/:id", dynamicPaywall, async (req, res) => {
         recipientAddress: resource.walletAddress,
         amount: resource.price,
         deliveryStatus,
+        // Freeze content identity + pricing terms so the receipt stays
+        // interpretable after the resource is edited or transferred.
+        ...buildPurchaseSnapshot(resource),
       })
       .returning();
     // Starts pending; flips to settled/failed once x402 settles (#99).
@@ -422,6 +425,7 @@ router.get("/resources/:id", dynamicPaywall, async (req, res) => {
         currency: "USDC",
         paidTo: payment.recipientAddress,
         paidAt: payment.paidAt,
+        terms: toReceiptTerms(payment),
       },
     });
     return;
@@ -464,6 +468,9 @@ router.get("/resources/:id", dynamicPaywall, async (req, res) => {
   res.setHeader("X-Payment-Id", payment.id);
   res.setHeader("X-Payment-Amount", `${payment.amount} USDC`);
   res.setHeader("X-Payment-Recipient", payment.recipientAddress);
+  if (payment.network) res.setHeader("X-Payment-Network", payment.network);
+  if (payment.asset) res.setHeader("X-Payment-Asset", `${RECEIPT_ASSET_CODE}:${payment.asset}`);
+  if (payment.resourceContentHash) res.setHeader("X-Content-Hash", payment.resourceContentHash);
 
   const { buffer, mimeType } = fileContent;
   res.setHeader("Content-Type", mimeType);

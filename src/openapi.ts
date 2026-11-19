@@ -37,8 +37,10 @@ export const openApiSpec = {
         in: "header",
         name: "x-wallet-signature",
         description:
-          "Base64 Stellar Ed25519 signature of `synapsvault-wallet-auth-v1\\nGET\\n{request path}\\n{unix timestamp}`. " +
-          "The timestamp must be within five minutes of server time.",
+          "Base64 Stellar Ed25519 signature of `synapsvault-wallet-auth-v2\\n{METHOD}\\n{request path}\\n{canonical query}\\n{unix timestamp}`. " +
+          "The canonical query is the query parameters decoded, sorted by key then value, RFC 3986 percent-encoded and joined with `&` (empty when there is no query). " +
+          "The timestamp must be within five minutes of server time. " +
+          "The deprecated v1 message (`synapsvault-wallet-auth-v1\\n{METHOD}\\n{request path}\\n{unix timestamp}`) is only accepted for requests without a query string.",
       },
       RequestSignature: {
         type: "apiKey",
@@ -577,7 +579,7 @@ export const openApiSpec = {
         summary: "List payments made by a buyer",
         operationId: "getBuyerPayments",
         description:
-          "Requires a signature from the Stellar account at `address`. Sign `synapsvault-wallet-auth-v1\\nGET\\n{request path}\\n{unix timestamp}` and send it in X-Wallet-Signature with X-Wallet-Timestamp.",
+          "Requires a signature from the Stellar account at `address`. Sign `synapsvault-wallet-auth-v2\\nGET\\n{request path}\\n{canonical query}\\n{unix timestamp}` and send it in X-Wallet-Signature with X-Wallet-Timestamp.",
         security: [{ WalletSignatureAuth: [] }],
         parameters: [
           {
@@ -1802,6 +1804,84 @@ export const openApiSpec = {
           },
           "404": {
             description: "Resource not found",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+        },
+      },
+    },
+    "/admin/payments/exceptions": {
+      get: {
+        tags: ["Admin"],
+        summary: "List payment settlement/delivery exceptions for reconciliation",
+        operationId: "getAdminPaymentExceptions",
+        description:
+          "Oldest-first, bounded list of payments needing recovery plus summary counts over the whole matching set. With neither settlement nor delivery given, returns payments that are not settled OR undelivered.",
+        security: [{ AdminKey: [] }],
+        parameters: [
+          {
+            name: "settlement",
+            in: "query",
+            required: false,
+            schema: { type: "string", example: "pending,failed" },
+            description: "Comma-separated settlement states: pending, settled, failed",
+          },
+          {
+            name: "delivery",
+            in: "query",
+            required: false,
+            schema: { type: "string", example: "undelivered" },
+            description: "Comma-separated delivery states: delivered, undelivered",
+          },
+          {
+            name: "minAgeMinutes",
+            in: "query",
+            required: false,
+            schema: { type: "integer", minimum: 0, maximum: 525600, default: 0 },
+            description: "Only include payments made at least this many minutes ago",
+          },
+          {
+            name: "limit",
+            in: "query",
+            required: false,
+            schema: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+            description: "Max entries returned (1-200, default 50)",
+          },
+        ],
+        responses: {
+          "200": {
+            description: "Exception entries and summary counts",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    filters: { type: "object" },
+                    limit: { type: "integer" },
+                    truncated: { type: "boolean" },
+                    entries: { type: "array", items: { type: "object" } },
+                    summary: {
+                      type: "object",
+                      properties: {
+                        total: { type: "integer" },
+                        bySettlement: { type: "object" },
+                        byDelivery: { type: "object" },
+                        byAge: { type: "object" },
+                        oldestPaidAt: { type: "string", format: "date-time", nullable: true },
+                        oldestAgeSeconds: { type: "integer", nullable: true },
+                      },
+                    },
+                    generatedAt: { type: "string", format: "date-time" },
+                  },
+                },
+              },
+            },
+          },
+          "400": {
+            description: "Invalid filter value",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+          "401": {
+            description: "Missing or invalid X-Admin-Key",
             content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
         },

@@ -121,6 +121,25 @@ npm run dev
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for local setup, migrations, and workflow details.
 
+## Request-signature replay protection across replicas
+
+Signed publisher mutations (`REQUIRE_REQUEST_SIGNATURE=true`) reject a signature that was already used. Where that "already used" record lives decides what holds across replicas:
+
+| Setup | Store | Guarantee |
+| --- | --- | --- |
+| `REDIS_URL` unset | Per-process memory | Correct for a **single replica only** (production boot logs a warning). |
+| `REDIS_URL` set, Redis healthy | Redis `SET NX` + TTL | At most one acceptance per signature across all replicas. |
+| `REDIS_URL` set, Redis unavailable | Decided by `REPLAY_PROTECTION_FAILURE_MODE` | See below. |
+
+On cold start and after a reconnect, the first signed requests wait up to `REPLAY_REDIS_CONNECT_TIMEOUT_MS` (default 2000 ms) for Redis to be ready. They don't fall back to local memory straight away. The same bound applies to each replay-check command.
+
+`REPLAY_PROTECTION_FAILURE_MODE` (when Redis can't answer: outage, timeout, or init past the bound):
+
+- **`closed`** (default when `NODE_ENV=production`): the mutation is rejected with `503 SERVICE_UNAVAILABLE`, so no signature can ever be accepted twice. The tradeoff is that signed mutations are unavailable while Redis is down. Reads, purchases and unsigned routes are unaffected. Because the rejected signature was never recorded, clients can retry it within the skew window once Redis recovers.
+- **`open`** (default elsewhere): the replica falls back to its own in-process cache, so mutations stay available. The tradeoff is that while the outage lasts, a captured signature can be replayed once against each *other* replica. Production boot logs a warning for this setting.
+
+Every degraded check increments `business_events_total{event="replay_check.degraded",outcome="rejected"|"local_fallback"}` and logs `replay_cache_redis_degraded`. Alert on it. Once Redis is reachable again, replicas reconnect on the next request and the shared guarantee resumes automatically.
+
 ## Release Provenance
 
 Every published backend image embeds reproducible release metadata and ships with a dependency SBOM so operators can identify exactly what is running in a container.

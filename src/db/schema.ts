@@ -65,6 +65,8 @@ export const publishers = pgTable(
     rateLimitRpm: integer("rate_limit_rpm"),
     // Webhook delivery configuration. Nullable so publishers can opt in later.
     webhookUrl: text("webhook_url"),
+    // Encrypted with WEBHOOK_ENCRYPTION_KEY as `v1:<keyId>:<base64>` (legacy
+    // rows may be un-prefixed ciphertext or plaintext) — see src/utils/crypto.ts.
     webhookSecret: text("webhook_secret"),
     // Subscribed WebhookEvent values; null/empty means all events.
     webhookEvents: text("webhook_events").array(),
@@ -72,6 +74,7 @@ export const publishers = pgTable(
     // Per-publisher HMAC signing secret (shown once on creation/rotation, stored
     // encrypted). Used by requestSignatureAuth (#42) instead of the raw API key
     // so possession of the key alone is insufficient to forge a valid signature.
+    // Stored as `v1:<keyId>:<base64>` so keys rotate without an atomic rewrite.
     signingSecret: text("signing_secret"),
     // Set when the publisher rotates their API key. Any key whose hash matches
     // a row with a non-null api_key_revoked_at is rejected by apiKeyAuth (#40).
@@ -263,6 +266,16 @@ export const payments = pgTable(
     // Settlement state of the payment. Only settled payments count toward
     // earnings (#99).
     status: paymentStatusEnum("status").notNull().default("pending"),
+    // Purchase snapshot — what was bought and on what terms, frozen at
+    // purchase time so receipts survive later resource edits. NULL
+    // receipt_version marks a legacy row recorded before snapshots existed;
+    // those are never back-filled (see src/lib/purchaseSnapshot.ts).
+    receiptVersion: integer("receipt_version"),
+    network: text("network"),
+    asset: text("asset"),
+    resourceTitle: text("resource_title"),
+    resourceType: text("resource_type"),
+    resourceContentHash: text("resource_content_hash"),
     paidAt: timestamp("paid_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
@@ -273,6 +286,13 @@ export const payments = pgTable(
     resourceIdIdx: index("idx_payments_resource_id").on(table.resourceId),
     // Agent-status earnings sum per recipient (#99).
     recipientAddressIdx: index("idx_payments_recipient_address").on(table.recipientAddress),
+    // Admin reconciliation filters exceptions by settlement / delivery state
+    // and orders oldest-first.
+    statusPaidAtIdx: index("idx_payments_status_paid_at").on(table.status, table.paidAt),
+    deliveryStatusPaidAtIdx: index("idx_payments_delivery_status_paid_at").on(
+      table.deliveryStatus,
+      table.paidAt,
+    ),
   }),
 );
 
