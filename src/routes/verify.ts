@@ -4,7 +4,12 @@ import type { RoutesConfig } from "@x402/core/server";
 import { and, eq, desc, inArray, isNotNull, isNull, sum, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { resources, verifications, payments } from "../db/schema.js";
-import { checkOriginality } from "../services/verificationService.js";
+import {
+  checkOriginality,
+  reserveVerificationSpend,
+  releaseVerificationSpend,
+  claimVerificationGeneration,
+} from "../services/verificationService.js";
 import { enqueueWebhookEvent } from "../services/webhookService.js";
 
 import { config } from "../config.js";
@@ -133,6 +138,39 @@ router.post(
     });
 
     const reviewType: ReviewResourceType = res.locals.reviewResourceType ?? "text";
+
+    // Daily spend budget gate (#186): reserve estimated spend before any paid
+    // provider call. The reservation is shared across processes, so concurrent
+    // requests cannot collectively exceed the documented daily budget. A
+    // rejected request is never charged (the x402 fee only settles on <400).
+    let reservation;
+    try {
+      reservation = await reserveVerificationSpend();
+    } catch (err) {
+      if ((err as Error)?.name === "VerificationBudgetExceededError") {
+        businessEventsTotal.inc({ event: "verification.completed", outcome: "budget_exceeded" });
+        res.setHeader("Retry-After", "3600");
+        throw new AppError("SERVICE_UNAVAILABLE", "Daily verification budget exhausted; retry later", {
+          retryable: true,
+          reason: "budget_exceeded",
+        });
+      }
+      throw err;
+    }
+
+    // Claim a new verification generation for the resource (#183). The final
+    // resource update only applies while this generation is still current, so
+    // a slow older check cannot overwrite a newer verdict or verificationId.
+    let generation: number | undefined;
+    if (resourceId) {
+      try {
+        generation = await claimVerificationGeneration(resourceId);
+      } catch (err) {
+        await releaseVerificationSpend(reservation);
+        throw err;
+      }
+    }
+
     let result;
     try {
       result = await checkOriginality(content, reviewType, {
@@ -140,6 +178,8 @@ router.post(
         timeoutMs: config.VERIFICATION_TIMEOUT_MS,
       });
     } catch (err) {
+      // The provider call did not consume budget; release the reservation.
+      await releaseVerificationSpend(reservation);
       const name = (err as Error)?.name;
       if (name === "VerificationCanceledError" || abort.signal.aborted) return;
       if (name === "VerificationProviderError") {
@@ -155,7 +195,10 @@ router.post(
       }
       throw err;
     }
-    if (abort.signal.aborted) return;
+    if (abort.signal.aborted) {
+      await releaseVerificationSpend(reservation);
+      return;
+    }
     const { usage } = result;
 
     // Record business metrics for the completed verification.
@@ -171,7 +214,8 @@ router.post(
       {
         event: "verification_usage",
         resourceId: resourceId ?? null,
-        model: config.OPENROUTER_MODEL,
+        model: result.model,
+        promptVersion: result.promptVersion,
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,
         totalTokens: usage.totalTokens,
@@ -205,6 +249,8 @@ router.post(
             completionTokens: usage.completionTokens,
             totalTokens: usage.totalTokens,
             estimatedCost: usage.estimatedCostUsd.toString(),
+            model: result.model,
+            promptVersion: result.promptVersion,
           })
           .returning();
 
@@ -227,6 +273,8 @@ router.post(
         // Re-checks ownership and the admin delist so a change made since the
         // pre-payment check can't be overwritten. A listing only goes live when
         // the model approves *and* the deterministic check agrees (#96).
+        // The generation guard (#183) ensures a slow older check cannot replace
+        // a newer verdict or verificationId claimed after it started.
         const [updated] = await tx
           .update(resources)
           .set({
@@ -243,6 +291,7 @@ router.post(
               eq(resources.id, resourceId),
               eq(resources.publisherId, req.publisher!.id),
               isNull(resources.adminDelistedAt),
+              eq(resources.verificationGeneration, generation!),
             ),
           )
           .returning({ publisherId: resources.publisherId, title: resources.title });
@@ -252,6 +301,9 @@ router.post(
 
       // A replayed authorization conflicts on the settlement key: no second row.
       if (payment) recordSettlementOnFinish(res, payment.id);
+
+      // The provider call consumed the reserved budget; settle it as consumed.
+      await releaseVerificationSpend(reservation, { consumed: true });
 
       if (updated && shouldList) {
         void enqueueWebhookEvent(updated.publisherId, "resource.listed", {
@@ -281,6 +333,21 @@ router.get("/agent/status", async (_req, res) => {
     })
     .from(verifications);
 
+  // Group new results by the model and prompt version that produced them
+  // (#185). Historical rows with null model/prompt_version remain readable and
+  // are grouped under a null bucket.
+  const byModelVersion = await db
+    .select({
+      model: verifications.model,
+      promptVersion: verifications.promptVersion,
+      totalVerifications: sql<number>`count(*)::int`,
+      verified: sql<number>`count(*) filter (where ${verifications.isOriginal})::int`,
+      rejected: sql<number>`count(*) filter (where not ${verifications.isOriginal})::int`,
+      totalEstimatedCost: sql<number>`coalesce(sum(${verifications.estimatedCost}), 0)::float8`,
+    })
+    .from(verifications)
+    .groupBy(verifications.model, verifications.promptVersion);
+
   // Only the 10 most recent rows are read for the activity list.
   const recentVerifications = await db
     .select({
@@ -290,6 +357,8 @@ router.get("/agent/status", async (_req, res) => {
       confidence: verifications.confidence,
       flags: verifications.flags,
       checkedAt: verifications.checkedAt,
+      model: verifications.model,
+      promptVersion: verifications.promptVersion,
     })
     .from(verifications)
     .orderBy(desc(verifications.checkedAt))
@@ -314,6 +383,8 @@ router.get("/agent/status", async (_req, res) => {
     confidence: v.confidence,
     flags: v.flags ? JSON.parse(v.flags) : [],
     checkedAt: v.checkedAt,
+    model: v.model,
+    promptVersion: v.promptVersion,
   }));
 
   const totalVerifications = Number(aggregates?.totalVerifications ?? 0);
@@ -370,6 +441,15 @@ router.get("/agent/status", async (_req, res) => {
       totalTokens,
       estimatedCostUsd: totalEstimatedCost.toFixed(6),
       model: config.OPENROUTER_MODEL,
+      // Per model/prompt-version breakdown of new verdicts (#185).
+      byModelVersion: byModelVersion.map((row) => ({
+        model: row.model,
+        promptVersion: row.promptVersion,
+        totalVerifications: Number(row.totalVerifications),
+        verified: Number(row.verified),
+        rejected: Number(row.rejected),
+        estimatedCostUsd: Number(row.totalEstimatedCost).toFixed(6),
+      })),
     },
     recentActivity: recentWithTitles,
   });

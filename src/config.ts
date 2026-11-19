@@ -255,6 +255,12 @@ export const envSchema = z.object({
   // pricing; override per model if you change OPENROUTER_MODEL.
   VERIFICATION_PROMPT_COST_PER_1M: z.coerce.number().nonnegative().default(3),
   VERIFICATION_COMPLETION_COST_PER_1M: z.coerce.number().nonnegative().default(15),
+  // Daily budget (USD) for paid verification spend across all publishers (#186).
+  // Spend is reserved before the model call and settled afterwards; requests
+  // that would push the day's reserved + consumed spend over this limit are
+  // rejected with 429 before any provider cost is incurred. Set to 0 to
+  // disable paid verification entirely.
+  VERIFICATION_DAILY_SPEND_LIMIT_USD: z.coerce.number().nonnegative().default(50),
 
   // Rate limiting (verify-content + publish)
   RATE_LIMIT_REGISTER_IP_MAX: z.coerce.number().default(10),

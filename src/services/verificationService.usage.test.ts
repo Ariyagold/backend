@@ -237,3 +237,63 @@ describe("checkOriginality response parsing", () => {
     expect(result.confidence).toBeLessThanOrEqual(1);
   });
 });
+
+describe("checkOriginality strict verdict validation (#180)", () => {
+  beforeEach(() => mockCreate.mockReset());
+
+  const respond = (content: string) =>
+    mockCreate.mockResolvedValue({
+      choices: [{ message: { content } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    });
+
+  it("accepts a literal boolean true verdict", async () => {
+    respond('{"is_original":true,"confidence":0.9,"flags":[]}');
+
+    const result = await checkOriginality("x", "text");
+
+    expect(result.isOriginal).toBe(true);
+    expect(result.needsReview).toBe(false);
+  });
+
+  it("accepts a literal boolean false verdict", async () => {
+    respond('{"is_original":false,"confidence":0.9,"flags":[]}');
+
+    const result = await checkOriginality("x", "text");
+
+    expect(result.isOriginal).toBe(false);
+  });
+
+  it.each([
+    ['the string "false"', '{"is_original":"false","confidence":0.9,"flags":[]}'],
+    ['the string "true"', '{"is_original":"true","confidence":0.9,"flags":[]}'],
+    ["a number 1", '{"is_original":1,"confidence":0.9,"flags":[]}'],
+    ["a number 0", '{"is_original":0,"confidence":0.9,"flags":[]}'],
+    ["null", '{"is_original":null,"confidence":0.9,"flags":[]}'],
+    ["a missing verdict", '{"confidence":0.9,"flags":[]}'],
+  ])("does not approve when is_original is %s", async (_label, content) => {
+    respond(content);
+
+    const result = await checkOriginality("x", "text");
+
+    expect(result.isOriginal).toBe(false);
+    expect(result.needsReview).toBe(true);
+  });
+});
+
+describe("checkOriginality verdict provenance (#185)", () => {
+  beforeEach(() => mockCreate.mockReset());
+
+  it("records the model identifier and prompt version on the result", async () => {
+    mockCreate.mockResolvedValue({
+      choices: [{ message: { content: '{"is_original":true,"confidence":0.9,"flags":[]}' } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    });
+
+    const result = await checkOriginality("x", "text");
+
+    expect(result.model).toBe("anthropic/claude-sonnet-4");
+    expect(typeof result.promptVersion).toBe("string");
+    expect(result.promptVersion.length).toBeGreaterThan(0);
+  });
+});
