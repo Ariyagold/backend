@@ -10,6 +10,8 @@ const verificationRows = [
     isOriginal: true,
     confidence: 0.9,
     flags: null,
+    model: "gpt-4o-mini",
+    promptVersion: "v1",
     checkedAt: new Date("2026-01-03"),
   },
   {
@@ -18,6 +20,8 @@ const verificationRows = [
     isOriginal: false,
     confidence: 0.4,
     flags: JSON.stringify(["duplicate"]),
+    model: "gpt-4o-mini",
+    promptVersion: "v1",
     checkedAt: new Date("2026-01-02"),
   },
   {
@@ -26,6 +30,8 @@ const verificationRows = [
     isOriginal: true,
     confidence: 0.95,
     flags: null,
+    model: null,
+    promptVersion: null,
     checkedAt: new Date("2026-01-01"),
   },
 ];
@@ -44,10 +50,18 @@ const aggregateTotals = {
 // "Unknown" fallback and confirm a single query covers every distinct resourceId.
 const resourceTitleRows = [{ id: "r1", title: "Resource One" }];
 
+// Grouped counts by model/prompt version for new rows; historical rows with a
+// null model/promptVersion are reported separately (#185).
+const modelBreakdownRows = [
+  { model: "gpt-4o-mini", promptVersion: "v1", count: 2 },
+  { model: null, promptVersion: null, count: 1 },
+];
+
 let resourceQueryCount = 0;
 let lastResourceIdsArg: unknown;
 let activityLimitArg: unknown;
 let aggregateQueryCount = 0;
+let modelBreakdownQueryCount = 0;
 // eq() conditions the route builds, so the payments mock can apply them as SQL would.
 const eqCalls: Array<[unknown, unknown]> = [];
 
@@ -106,6 +120,13 @@ vi.mock("../db/client.js", () => ({
           if (cols && typeof cols === "object" && "totalVerifications" in cols) {
             aggregateQueryCount++;
             return { then: (resolve: (rows: unknown[]) => unknown) => resolve([aggregateTotals]) };
+          }
+          // Model/version breakdown query: select({ model, promptVersion, count }).from(verifications).groupBy(...)
+          if (cols && typeof cols === "object" && "model" in cols && "promptVersion" in cols) {
+            modelBreakdownQueryCount++;
+            return {
+              groupBy: () => Promise.resolve(modelBreakdownRows),
+            };
           }
           // Activity query: select({...}).from(verifications).orderBy(...).limit(10)
           return {
@@ -192,6 +213,7 @@ describe("GET /agent/status — batched resource title lookup (#286)", () => {
     lastResourceIdsArg = undefined;
     activityLimitArg = undefined;
     aggregateQueryCount = 0;
+    modelBreakdownQueryCount = 0;
   });
 
   it("issues exactly one query for resource titles regardless of verification count", async () => {
@@ -217,6 +239,8 @@ describe("GET /agent/status — batched resource title lookup (#286)", () => {
         isOriginal: true,
         confidence: 0.9,
         flags: [],
+        model: "gpt-4o-mini",
+        promptVersion: "v1",
         checkedAt: verificationRows[0].checkedAt.toISOString(),
       },
       {
@@ -225,6 +249,8 @@ describe("GET /agent/status — batched resource title lookup (#286)", () => {
         isOriginal: false,
         confidence: 0.4,
         flags: ["duplicate"],
+        model: "gpt-4o-mini",
+        promptVersion: "v1",
         checkedAt: verificationRows[1].checkedAt.toISOString(),
       },
       {
@@ -233,10 +259,23 @@ describe("GET /agent/status — batched resource title lookup (#286)", () => {
         isOriginal: true,
         confidence: 0.95,
         flags: [],
+        model: null,
+        promptVersion: null,
         checkedAt: verificationRows[2].checkedAt.toISOString(),
       },
     ]);
     expect(res.body.stats.totalVerifications).toBe(aggregateTotals.totalVerifications);
+  });
+
+  it("groups new results by model and prompt version, reporting historical rows separately (#185)", async () => {
+    const res = await request(createTestApp()).get("/agent/status");
+
+    expect(res.status).toBe(200);
+    expect(modelBreakdownQueryCount).toBe(1);
+    expect(res.body.stats.byModel).toEqual([
+      { model: "gpt-4o-mini", promptVersion: "v1", count: 2 },
+    ]);
+    expect(res.body.stats.legacyVerifications).toBe(1);
   });
 
   it("computes totals via SQL aggregates matching the old in-memory values (#98)", async () => {

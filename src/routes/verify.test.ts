@@ -15,6 +15,15 @@ const h = vi.hoisted(() => ({
     string,
     unknown
   >,
+  // Rows returned by the resource lookup (where -> limit) path.
+  resourceRows: [] as Array<Record<string, unknown>>,
+  // Rows returned by the guarded resource update (where -> returning).
+  updateReturningRows: [] as Array<Record<string, unknown>> | null,
+  // Values passed to the verification-row insert (first insert call).
+  verificationInsertValues: [] as Array<Record<string, unknown>>,
+  // Daily spend budget gate (#186).
+  spendRows: [] as Array<Record<string, unknown>>,
+  budgetReject: null as null | { reason: string; limitUsd: number; spentUsd: number },
   // Settled verification-fee sum returned by the earnings query (#99).
   earnedTotal: null as string | null,
   recentRows: [] as Array<Record<string, unknown>>,
@@ -55,6 +64,7 @@ vi.mock("../db/client.js", () => {
       where: () => chain,
       groupBy: () => chain,
       orderBy: () => chain,
+      for: () => chain,
       limit: (n: number) => {
         // Distinguish the resource lookup from the recent-activity query by
         // whether the caller selected aggregate fields.
@@ -102,6 +112,23 @@ vi.mock("../db/schema.js", () => ({
   resources: {},
   verifications: {},
   payments: {},
+}));
+
+// The daily spend budget gate (#186) is mocked so tests can simulate
+// exhaustion and concurrency without real persistence.
+vi.mock("../services/spendBudgetService.js", () => ({
+  reserveVerificationSpend: vi.fn(async () => {
+    if (h.budgetReject) {
+      const { AppError } = await import("../lib/errors.js");
+      throw new AppError("BUDGET_EXCEEDED", h.budgetReject.reason, {
+        retryable: false,
+        ...h.budgetReject,
+      });
+    }
+    return { reservationId: "resv-1" };
+  }),
+  settleVerificationSpend: vi.fn(async () => undefined),
+  releaseVerificationSpend: vi.fn(async () => undefined),
 }));
 
 vi.mock("../lib/x402.js", () => ({
@@ -220,18 +247,32 @@ describe("POST /verify-content — AI content verification endpoint", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     h.resourceRows = [];
+    h.updateReturningRows = null;
+    h.verificationInsertValues = [];
+    h.budgetReject = null;
     h.checkOriginality.mockReset();
     h.insert.mockImplementation(() => ({
-      values: vi.fn(() => ({
-        returning: vi.fn(() => Promise.resolve([{ id: "v1" }])),
-      })),
+      values: vi.fn((values: Record<string, unknown>) => {
+        // Record the verification row's values (the first insert) so tests can
+        // assert on persisted model/prompt metadata (#185).
+        if (values && "isOriginal" in values) {
+          h.verificationInsertValues.push(values);
+        }
+        return {
+          returning: vi.fn(() => Promise.resolve([{ id: "v1" }])),
+        };
+      }),
     }));
     h.update.mockImplementation(() => ({
       set: vi.fn((values: unknown) => {
         h.setValues(values);
         return {
           where: vi.fn(() => ({
-            returning: vi.fn(() => Promise.resolve([{ publisherId: "pub-1", title: "Doc" }])),
+            returning: vi.fn(() =>
+              Promise.resolve(
+                h.updateReturningRows ?? [{ publisherId: "pub-1", title: "Doc" }],
+              ),
+            ),
           })),
         };
       }),
@@ -473,6 +514,122 @@ describe("POST /verify-content — AI content verification endpoint", () => {
 
       expect(res.status).toBe(409);
       expectNothingChanged();
+    });
+
+    // ── Generation guard (#183) ──────────────────────────────────────────
+
+    it("does not overwrite a newer verdict when an older check finishes last (#183)", async () => {
+      h.resourceRows = [fileRow()];
+      h.checkOriginality.mockResolvedValue(approved());
+      // The guarded update matches no row: a newer verification generation
+      // has already claimed the resource.
+      h.updateReturningRows = [];
+
+      const res = await request(createTestApp())
+        .post("/verify-content")
+        .set("x-api-key", "key-pub-1")
+        .send({ content: DOC_TEXT, resourceId: "res-1" });
+
+      // The stale result must not be reported as the current verdict, and the
+      // resource row must not be replaced by the older check.
+      expect(res.status).not.toBe(200);
+      expect(h.setValues).not.toHaveBeenCalledWith(
+        expect.objectContaining({ verificationStatus: "verified" }),
+      );
+    });
+
+    it("applies the verdict when the generation guard still matches (#183)", async () => {
+      h.resourceRows = [fileRow()];
+      h.checkOriginality.mockResolvedValue(approved());
+      h.updateReturningRows = [{ publisherId: "pub-1", title: "Doc" }];
+
+      const res = await request(createTestApp())
+        .post("/verify-content")
+        .set("x-api-key", "key-pub-1")
+        .send({ content: DOC_TEXT, resourceId: "res-1" });
+
+      expect(res.status).toBe(200);
+      expect(h.setValues).toHaveBeenCalledWith(
+        expect.objectContaining({ verificationStatus: "verified", verificationId: "v1" }),
+      );
+    });
+
+    // ── Model / prompt version provenance (#185) ─────────────────────────
+
+    it("persists the model identifier and prompt version on new verification rows (#185)", async () => {
+      h.resourceRows = [fileRow()];
+      h.checkOriginality.mockResolvedValue(approved());
+
+      const res = await request(createTestApp())
+        .post("/verify-content")
+        .set("x-api-key", "key-pub-1")
+        .send({ content: DOC_TEXT, resourceId: "res-1" });
+
+      expect(res.status).toBe(200);
+      expect(h.verificationInsertValues).toHaveLength(1);
+      expect(h.verificationInsertValues[0]).toMatchObject({
+        model: "test-model",
+        promptVersion: expect.any(String),
+      });
+      expect((h.verificationInsertValues[0].promptVersion as string).length).toBeGreaterThan(0);
+    });
+
+    // ── Daily spend budget gate (#186) ───────────────────────────────────
+
+    it("rejects with 429 when the daily spend budget is exhausted, without charging (#186)", async () => {
+      h.resourceRows = [fileRow()];
+      h.budgetReject = {
+        reason: "Daily verification spend limit reached",
+        limitUsd: 5,
+        spentUsd: 5,
+      };
+
+      const res = await request(createTestApp())
+        .post("/verify-content")
+        .set("x-api-key", "key-pub-1")
+        .send({ content: DOC_TEXT, resourceId: "res-1" });
+
+      expect(res.status).toBe(429);
+      expect(h.checkOriginality).not.toHaveBeenCalled();
+      expect(h.insert).not.toHaveBeenCalled();
+      expect(h.update).not.toHaveBeenCalled();
+    });
+
+    it("never exceeds the budget under concurrent requests (#186)", async () => {
+      const { reserveVerificationSpend } = await import("../services/spendBudgetService.js");
+      const limitUsd = 0.1;
+      let reserved = 0;
+      const costPerCheck = 0.05;
+      // Atomic reservation: only succeeds while the budget has room.
+      vi.mocked(reserveVerificationSpend).mockImplementation(async () => {
+        if (reserved + costPerCheck > limitUsd) {
+          const { AppError } = await import("../lib/errors.js");
+          throw new AppError("BUDGET_EXCEEDED", "Daily verification spend limit reached", {
+            retryable: false,
+          });
+        }
+        reserved += costPerCheck;
+        return { reservationId: `resv-${reserved}` };
+      });
+      h.resourceRows = [fileRow()];
+      h.checkOriginality.mockResolvedValue(approved());
+
+      const app = createTestApp();
+      const responses = await Promise.all(
+        Array.from({ length: 5 }, () =>
+          request(app)
+            .post("/verify-content")
+            .set("x-api-key", "key-pub-1")
+            .send({ content: DOC_TEXT, resourceId: "res-1" }),
+        ),
+      );
+
+      const accepted = responses.filter((r) => r.status === 200).length;
+      const rejected = responses.filter((r) => r.status === 429).length;
+      expect(accepted).toBe(2);
+      expect(rejected).toBe(3);
+      expect(reserved).toBeLessThanOrEqual(limitUsd);
+      expect(h.checkOriginality).toHaveBeenCalledTimes(accepted);
     });
 
     // ── Transactional write (#182) ────────────────────────────────────────

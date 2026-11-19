@@ -119,6 +119,11 @@ export const resources = pgTable(
     mimeType: text("mime_type"),
     verificationStatus: verificationStatusEnum("verification_status").notNull().default("pending"),
     verificationId: text("verification_id"),
+    // Monotonic per-resource verification generation (#183). Each new check
+    // claims the next value; a check may only write its verdict while the
+    // resource still carries the generation it claimed, so a slow older check
+    // can't overwrite a newer verdict or verificationId.
+    verificationGeneration: integer("verification_generation").notNull().default(0),
     listed: boolean("listed").notNull().default(false),
     // Set when an administrator delists the resource. Publisher-initiated
     // delists leave it null. Blocks relisting via POST /verify-content (#18).
@@ -168,6 +173,11 @@ export const resources = pgTable(
     thumbnailAttemptsNonNegative: check(
       "resources_thumbnail_attempts_nonneg",
       sql`${table.thumbnailAttempts} >= 0`,
+    ),
+    // Generation is a monotonic counter (#183).
+    verificationGenerationNonNegative: check(
+      "resources_verification_generation_nonneg",
+      sql`${table.verificationGeneration} >= 0`,
     ),
   }),
 );
@@ -219,6 +229,11 @@ export const verifications = pgTable(
     estimatedCost: text("estimated_cost"), // USD, stringified for precision
     // Review-input contract the verdict was produced under (#189); null on legacy rows.
     inputContractVersion: text("input_contract_version"),
+    // Provenance of the verdict (#185): which model produced it and which
+    // immutable prompt/policy version was in force. Null on legacy rows so
+    // historical verdicts stay readable; reporting can group by these.
+    model: text("model"),
+    promptVersion: text("prompt_version"),
     checkedAt: timestamp("checked_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
@@ -227,6 +242,11 @@ export const verifications = pgTable(
     checkedAtIdx: index("idx_verifications_checked_at").on(table.checkedAt),
     // Verification lookups by resource (#107).
     resourceIdIdx: index("idx_verifications_resource_id").on(table.resourceId),
+    // Spend reporting groups new verdicts by model and prompt version (#185).
+    modelPromptVersionIdx: index("idx_verifications_model_prompt_version").on(
+      table.model,
+      table.promptVersion,
+    ),
     // Confidence is a probability; token counts can't be negative (#176).
     confidenceRange: check(
       "verifications_confidence_range",
@@ -243,6 +263,33 @@ export const verifications = pgTable(
     totalTokensNonNegative: check(
       "verifications_total_tokens_nonneg",
       sql`${table.totalTokens} IS NULL OR ${table.totalTokens} >= 0`,
+    ),
+  }),
+);
+
+// Daily verification spend budget (#186). One row per UTC day holds the
+// reserved (in-flight) and consumed (settled) spend so the budget gate is
+// shared across replicas and concurrent requests can't overspend.
+export const verificationSpendBudget = pgTable(
+  "verification_spend_budget",
+  {
+    // UTC day, formatted YYYY-MM-DD.
+    budgetDate: text("budget_date").primaryKey(),
+    // Reserved spend for checks that have started but not yet settled, USD.
+    reservedSpend: text("reserved_spend").notNull().default("0"),
+    // Consumed spend for completed checks, USD.
+    consumedSpend: text("consumed_spend").notNull().default("0"),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    // Amounts are non-negative decimal strings; the cast fails on garbage.
+    reservedSpendNonNegative: check(
+      "verification_spend_budget_reserved_nonneg",
+      sql`${table.reservedSpend}::numeric >= 0`,
+    ),
+    consumedSpendNonNegative: check(
+      "verification_spend_budget_consumed_nonneg",
+      sql`${table.consumedSpend}::numeric >= 0`,
     ),
   }),
 );

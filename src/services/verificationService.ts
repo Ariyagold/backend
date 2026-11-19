@@ -2,10 +2,13 @@ import OpenAI from "openai";
 import { config } from "../config.js";
 import {
   INPUT_CONTRACT_VERSION,
+  PROMPT_VERSION,
   VerificationCanceledError,
   VerificationProviderError,
+  parseModelVerdict,
   type ReviewResourceType,
 } from "../lib/verificationContract.js";
+import { reserveVerificationSpend, settleVerificationSpend } from "../db/schema.js";
 
 const OpenAIClient = (OpenAI as any).default || OpenAI;
 
@@ -34,6 +37,10 @@ export interface VerificationResult {
   needsReview: boolean;
   /** Version of the review-input contract the verdict was produced under (#189). */
   inputContractVersion: string;
+  /** OpenRouter model identifier that produced the verdict (#185). */
+  model: string;
+  /** Immutable prompt/policy version the verdict was produced under (#185). */
+  promptVersion: string;
 }
 
 export interface CheckOriginalityOptions {
@@ -169,6 +176,20 @@ export async function checkOriginality(
 
   const truncated = content.slice(0, 10000);
 
+  // Budget gate (#186): reserve the worst-case spend for this call before any
+  // paid work begins. Concurrent requests share the reservation table, so the
+  // daily limit cannot be exceeded; rejected work releases its reservation.
+  const reservation = await reserveVerificationSpend(
+    estimateCostUsd(10000 / 4, 1024),
+    config.VERIFICATION_DAILY_SPEND_LIMIT_USD,
+  );
+  if (!reservation) {
+    throw new VerificationProviderError(
+      "budget_exceeded",
+      "Daily verification spend limit reached; try again later",
+    );
+  }
+
   // Deterministic pre-check: never let injected instructions influence the
   // outcome. The model still reviews the (delimited) listing, but a match
   // forces the listing into review whatever the model says.
@@ -221,6 +242,7 @@ Respond with JSON only.`,
     ],
   }, { signal });
   } catch (err) {
+    await settleVerificationSpend(reservation, 0);
     if (options.signal?.aborted) throw new VerificationCanceledError();
     if (timeoutSignal.aborted) {
       throw new VerificationProviderError("timeout", "Verification model timed out", { cause: err });
@@ -229,43 +251,74 @@ Respond with JSON only.`,
   }
 
   const usage = toUsage(response.usage);
+  // Consume the actual spend and release the unused reservation (#186).
+  await settleVerificationSpend(reservation, usage.estimatedCostUsd);
 
   const text = response.choices[0]?.message?.content?.trim();
   if (!text) {
     throw new VerificationProviderError("empty_response", "Verification model returned an empty response");
   }
 
+  const baseResult = {
+    usage,
+    deterministicPassed,
+    inputContractVersion: INPUT_CONTRACT_VERSION,
+    model: config.OPENROUTER_MODEL,
+    promptVersion: PROMPT_VERSION,
+  };
+
+  let parsed: unknown;
   try {
-    const parsed = extractJsonObject(text) as Record<string, unknown>;
-    const confidence = clampConfidence(parsed.confidence);
-    const flags: string[] = Array.isArray(parsed.flags) ? parsed.flags.map(String) : [];
-    flags.push(...injectionFlags);
-
-    // Require a confidence threshold before auto-approving; otherwise hold for
-    // review so a listing never changes on a low-confidence verdict (#96).
-    const modelApproved = Boolean(parsed.is_original);
-    const confident = confidence >= AUTO_APPROVE_CONFIDENCE_THRESHOLD;
-    const isOriginal = modelApproved && confident && deterministicPassed;
-    if (modelApproved && !confident) {
-      flags.push(
-        `Model confidence ${confidence.toFixed(2)} is below the auto-approval threshold of ${AUTO_APPROVE_CONFIDENCE_THRESHOLD}; held for review.`,
-      );
-    }
-
-    return {
-      isOriginal,
-      confidence,
-      flags,
-      usage,
-      deterministicPassed,
-      needsReview: !isOriginal && ((modelApproved && !confident) || !deterministicPassed),
-      inputContractVersion: INPUT_CONTRACT_VERSION,
-    };
+    parsed = extractJsonObject(text);
   } catch (err) {
     throw new VerificationProviderError("unparsable_response", "Verification model response was not valid JSON", {
       cause: err,
     });
   }
+
+  // Strict runtime schema (#180): only a real boolean verdict can approve.
+  // Strings ("false"), numbers, null and missing verdicts fail validation and
+  // are held for review rather than approved.
+  const verdict = parseModelVerdict(parsed);
+  if (!verdict) {
+    console.warn("[verification] Model verdict failed schema validation; holding for review", {
+      model: config.OPENROUTER_MODEL,
+      promptVersion: PROMPT_VERSION,
+    });
+    return {
+      ...baseResult,
+      isOriginal: false,
+      confidence: 0,
+      flags: [
+        ...injectionFlags,
+        "Verification model returned a malformed verdict; held for manual review.",
+      ],
+      needsReview: true,
+    };
+  }
+
+  const confidence = clampConfidence(verdict.confidence);
+  const flags: string[] = [...verdict.flags];
+  flags.push(...injectionFlags);
+
+  // Require a confidence threshold before auto-approving; otherwise hold for
+  // review so a listing never changes on a low-confidence verdict (#96).
+  const modelApproved = verdict.is_original;
+  const confident = confidence >= AUTO_APPROVE_CONFIDENCE_THRESHOLD;
+  const isOriginal = modelApproved && confident && deterministicPassed;
+  if (modelApproved && !confident) {
+    flags.push(
+      `Model confidence ${confidence.toFixed(2)} is below the auto-approval threshold of ${AUTO_APPROVE_CONFIDENCE_THRESHOLD}; held for review.`,
+    );
+  }
+
+  return {
+    ...baseResult,
+    isOriginal,
+    confidence,
+    flags,
+    needsReview: !isOriginal && ((modelApproved && !confident) || !deterministicPassed),
+  };
 }
 
 export { ZERO_USAGE };
