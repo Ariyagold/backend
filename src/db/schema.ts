@@ -515,6 +515,8 @@ export const idempotencyRecords = pgTable(
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   },
   (table) => ({
+    // The expiry sweep selects expired keys ordered by expires_at in bounded
+    // batches (#173); this index keeps that scan cheap as the table grows.
     expiresAtIdx: index("idx_idempotency_records_expires_at").on(table.expiresAt),
   }),
 );

@@ -412,6 +412,10 @@ export const envSchema = z.object({
   // How long a publish Idempotency-Key is remembered so retries return the
   // original result instead of creating a duplicate (default 24h).
   IDEMPOTENCY_TTL_MS: z.coerce.number().int().min(1).max(604_800_000).default(86_400_000),
+  // Bounded background sweep of expired idempotency rows (#173). Batch size
+  // caps rows deleted per statement; the interval caps how often the sweep runs.
+  IDEMPOTENCY_CLEANUP_BATCH_SIZE: z.coerce.number().int().min(1).max(10000).default(100),
+  IDEMPOTENCY_CLEANUP_INTERVAL_MS: z.coerce.number().int().min(1_000).max(3_600_000).default(60_000),
   // Short-lived cache for catalog/preview reads to cut DB load. Kept low so
   // newly published/delisted resources surface quickly. 0 disables caching.
   CATALOG_CACHE_TTL_MS: z.coerce.number().int().min(0).max(3_600_000).default(10_000),

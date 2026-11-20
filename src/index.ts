@@ -15,6 +15,11 @@ import { startPaymentReconciliationWorker, stopPaymentReconciliationWorker } fro
 import { startRetryPendingWorker, stopRetryPendingWorker } from "./workers/retryPendingWorker.js";
 import { startEventListener, stopEventListener } from "./workers/eventListener.js";
 import { startWebhookOutboxWorker, stopWebhookOutboxWorker } from "./workers/webhookOutboxWorker.js";
+import {
+  startIdempotencyCleanupWorker,
+  stopIdempotencyCleanupWorker,
+} from "./workers/idempotencyCleanupWorker.js";
+import { createPostgresRowStore, type PgSql } from "./lib/idempotencyPgStore.js";
 import { closeRateLimitStore } from "./lib/rateLimit/index.js";
 import { closeSignatureReplayStore } from "./middleware/requestSignatureAuth.js";
 // Advisory lock key used to elect a single leader across replicas. Only the
@@ -78,6 +83,11 @@ function startWorkers(): void {
   startPaymentReconciliationWorker();
   startEventListener();
   startWebhookOutboxWorker();
+  // Sweep expired idempotency rows in bounded batches (#173). The deleter is
+  // wired here so the worker stays independent of the Postgres client and can
+  // be tested with a fake; only the elected leader runs it.
+  const idempotencyRows = createPostgresRowStore(pgClient as unknown as PgSql);
+  startIdempotencyCleanupWorker((batchSize) => idempotencyRows.deleteExpired(batchSize));
   startLeaderHealthCheck();
 }
 
@@ -88,6 +98,7 @@ function stopWorkers(): void {
   stopPaymentReconciliationWorker();
   stopEventListener();
   stopWebhookOutboxWorker();
+  stopIdempotencyCleanupWorker();
   rootLogger.info({ event: "workers_stopped" }, "background workers stopped");
 }
 
