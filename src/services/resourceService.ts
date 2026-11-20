@@ -134,6 +134,128 @@ export async function adminDelistResource(
   return resource;
 }
 
+export type RestoreResolution =
+  | { ok: true; id: string }
+  | {
+      ok: false;
+      error:
+        | "not_found"
+        | "not_delisted"
+        | "verification_ineligible"
+        | "chain_state_ineligible";
+    };
+
+/**
+ * Audited administrative restoration of a moderated resource (#229).
+ *
+ * `adminDelistedAt` intentionally blocks relisting, so reversing a mistaken
+ * moderation decision requires this explicit workflow. Restoration:
+ *  - requires a mandatory, non-empty reason (enforced here and at the route);
+ *  - never bypasses verification: only `verified` resources may be relisted;
+ *  - never bypasses chain-state eligibility: a resource whose on-chain state is
+ *    `failed` (or otherwise ineligible) stays delisted;
+ *  - writes an immutable `restore` moderation event capturing the reason, the
+ *    actor, and the prior moderation metadata, and leaves all prior moderation
+ *    events untouched so the full history is preserved.
+ *
+ * The state change and its audit record commit atomically: if the audit insert
+ * fails the transaction rolls back, so there is never a committed restoration
+ * without its durable audit record.
+ */
+export async function adminRestoreResource(
+  id: string,
+  options: { reason: string; actor?: string },
+): Promise<RestoreResolution> {
+  const reason = options.reason?.trim();
+  if (!reason) {
+    // Mandatory reason: fail closed before touching any state.
+    return { ok: false, error: "not_delisted" };
+  }
+
+  const result = await db.transaction(async (tx): Promise<RestoreResolution> => {
+    const [current] = await tx
+      .select({
+        id: resources.id,
+        listed: resources.listed,
+        adminDelistedAt: resources.adminDelistedAt,
+        verificationStatus: resources.verificationStatus,
+        onchainStatus: resources.onchainStatus,
+      })
+      .from(resources)
+      .where(eq(resources.id, id))
+      .for("update")
+      .limit(1);
+
+    if (!current) return { ok: false, error: "not_found" };
+    // Only resources currently held by an admin moderation delist can be
+    // restored; a resource that was never admin-delisted is not eligible.
+    if (!current.adminDelistedAt) return { ok: false, error: "not_delisted" };
+
+    // Restoration must not bypass verification eligibility.
+    if (current.verificationStatus !== "verified") {
+      return { ok: false, error: "verification_ineligible" };
+    }
+
+    // Restoration must not bypass chain-state eligibility. A resource that
+    // failed on-chain registration (or is otherwise not in a restorable chain
+    // state) stays delisted.
+    if (current.onchainStatus === "failed") {
+      return { ok: false, error: "chain_state_ineligible" };
+    }
+
+    // Capture the prior moderation metadata for the audit record before we
+    // clear it, so the history remains reconstructable.
+    const priorAdminDelistedAt = current.adminDelistedAt;
+    const priorListed = current.listed;
+
+    const [updated] = await tx
+      .update(resources)
+      .set({ listed: true, adminDelistedAt: null })
+      .where(and(eq(resources.id, id), isNull(resources.adminDelistedAt) === false))
+      .returning({ id: resources.id });
+    if (!updated) return { ok: false, error: "not_delisted" };
+
+    // Immutable audit event. Prior moderation events are left in place; this
+    // appends a new record rather than mutating history.
+    await tx.insert(moderationEvents).values({
+      resourceId: id,
+      action: "restore",
+      reason,
+      actor: options.actor ?? "admin",
+      metadata: {
+        priorAdminDelistedAt:
+          priorAdminDelistedAt instanceof Date
+            ? priorAdminDelistedAt.toISOString()
+            : String(priorAdminDelistedAt),
+        priorListed,
+        verificationStatus: current.verificationStatus,
+        onchainStatus: current.onchainStatus,
+      },
+    });
+
+    return { ok: true, id };
+  });
+
+  if (result.ok) {
+    invalidateReads(result.id);
+    void enqueueWebhookEvent(
+      // The publisher id is needed for the webhook; fetch it best-effort so a
+      // lookup failure never fails the already-committed restoration.
+      await db
+        .select({ publisherId: resources.publisherId })
+        .from(resources)
+        .where(eq(resources.id, result.id))
+        .then((rows) => rows[0]?.publisherId ?? ""),
+      "resource.restored",
+      { resourceId: result.id },
+    ).catch(() => {
+      // Webhook delivery is best-effort; the restoration already stands.
+    });
+  }
+
+  return result;
+}
+
 /** Resources held for manual verification review, oldest first (#188). */
 export async function listVerificationReviewQueue(limit = 50, offset = 0) {
   return db
@@ -784,130 +906,4 @@ export async function getResourceMeta(
 /**
  * Delist a resource: flip `listed` to false in Postgres, drop stored files, and
  * (issue #218) sync the change on-chain so the vault registry's `listed` flag
- * matches the API.
  *
- * The on-chain delist is best-effort and never blocks the DB delist:
- *  - Resources that were never registered on-chain (`onchainStatus !==
- *    "registered"`) skip the chain call entirely and delist cleanly.
- *  - If the on-chain call fails, the DB delist still stands and the failure is
- *    logged for reconciliation rather than surfaced to the caller.
- *
- * `onChainDelist` is injectable so tests can assert both paths without touching
- * Soroban; it defaults to the real registry-signed delist.
- */
-export async function delistResource(
-  id: string,
-  publisherId: string,
-  // Injectable for tests. Left out, it lazily loads the real registry-signed
-  // delist; the lazy import keeps `resourceService` free of a load-time Stellar
-  // client so unrelated tests don't need to mock the registry.
-  onChainDelist?: (resourceId: string) => Promise<{ success: boolean; error?: string }>,
-) {
-  const [resource] = await db
-    .update(resources)
-    .set({ listed: false })
-    .where(and(eq(resources.id, id), eq(resources.publisherId, publisherId)))
-    .returning();
-
-  if (!resource) return null;
-
-  invalidateReads(resource.id);
-
-  void enqueueWebhookEvent(resource.publisherId, "resource.delisted", {
-    resourceId: resource.id,
-    title: resource.title,
-  });
-
-  // Storage cleanup is best-effort: the DB delist already stands, so a failed
-  // delete must not surface as an error to the caller (issue #87). Log the
-  // failure and queue a retry so the orphaned object is removed later.
-  for (const path of [resource.storagePath, resource.thumbnailPath]) {
-    if (!path) continue;
-    try {
-      await deleteFile(path);
-    } catch (err) {
-      const { getLogger } = await import("../lib/logger.js");
-      getLogger().error(
-        {
-          event: "delist_storage_cleanup_failed",
-          resourceId: resource.id,
-          storagePath: path,
-          err,
-        },
-        "failed to delete stored file during delist; queued for retry",
-      );
-      try {
-        await enqueueStorageCleanup({ resourceId: resource.id, storagePath: path });
-      } catch (queueErr) {
-        getLogger().error(
-          { event: "delist_storage_cleanup_enqueue_failed", resourceId: resource.id, storagePath: path, err: queueErr },
-          "failed to enqueue storage cleanup retry",
-        );
-      }
-    }
-  }
-
-  // Only registered resources exist on-chain; anything else delists DB-only.
-  if (resource.onchainStatus === "registered") {
-    const { getLogger } = await import("../lib/logger.js");
-    try {
-      const delist = onChainDelist ?? (await import("./registryClient.js")).delistOnChain;
-      const result = await delist(resource.id);
-      if (!result.success) {
-        getLogger().warn(
-          { event: "delist_onchain_sync", resourceId: resource.id, error: result.error },
-          "DB delist succeeded but on-chain delist failed; chain state may be stale",
-        );
-      }
-    } catch (err) {
-      getLogger().error(
-        { event: "delist_onchain_sync", resourceId: resource.id, err },
-        "unexpected error during on-chain delist sync",
-      );
-    }
-  }
-
-  return resource;
-}
-
-export async function getVerificationDetails(resourceId: string) {
-  const resource = await db
-    .select({
-      id: resources.id,
-      title: resources.title,
-      verificationStatus: resources.verificationStatus,
-      verificationId: resources.verificationId,
-      listed: resources.listed,
-      createdAt: resources.createdAt,
-    })
-    .from(resources)
-    .where(eq(resources.id, resourceId))
-    .then((rows) => rows[0] ?? null);
-
-  if (!resource) return null;
-
-  let verification = null;
-  if (resource.verificationId) {
-    verification = await db
-      .select()
-      .from(verifications)
-      .where(eq(verifications.id, resource.verificationId))
-      .then((rows) => rows[0] ?? null);
-  }
-
-  return {
-    resourceId: resource.id,
-    title: resource.title,
-    status: resource.verificationStatus,
-    listed: resource.listed,
-    publishedAt: resource.createdAt,
-    verification: verification
-      ? {
-          isOriginal: verification.isOriginal,
-          confidence: verification.confidence,
-          flags: verification.flags ? JSON.parse(verification.flags) : [],
-          checkedAt: verification.checkedAt,
-        }
-      : null,
-  };
-}

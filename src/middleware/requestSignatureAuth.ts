@@ -315,7 +315,13 @@ export async function requestSignatureAuth(req: Request, res: Response, next: Ne
     return;
   }
 
-  const fail = (message: string) => next(new AppError("UNAUTHORIZED", message));
+  const fail = (message: string) => {
+    // #230: signature middleware runs after the disk upload but before the
+    // publish handler, so its finally-block cleanup never runs on rejection.
+    // Run the idempotent cleanup registered at upload time before erroring.
+    void cleanupRequestUpload(req);
+    next(new AppError("UNAUTHORIZED", message));
+  };
 
   const apiKey = req.headers["x-api-key"];
   if (typeof apiKey !== "string") {

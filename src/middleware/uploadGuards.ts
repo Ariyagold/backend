@@ -16,10 +16,80 @@ export function __getActiveUploadCount(): number {
   return activeUploads;
 }
 
+/**
+ * Multipart resource bounds. The publish schemas accept a handful of text
+ * fields plus a single file, so anything beyond these limits is abusive.
+ */
+const MAX_MULTIPART_FIELDS = 16;
+const MAX_MULTIPART_PARTS = MAX_MULTIPART_FIELDS + 2;
+const MAX_MULTIPART_FIELD_SIZE = 8 * 1024;
+
 const upload = multer({
   storage: multer.diskStorage({ destination: os.tmpdir() }),
-  limits: { fileSize: config.MAX_FILE_SIZE_MB * 1024 * 1024 },
+  limits: {
+    fileSize: config.MAX_FILE_SIZE_MB * 1024 * 1024,
+    fields: MAX_MULTIPART_FIELDS,
+    parts: MAX_MULTIPART_PARTS,
+    fieldSize: MAX_MULTIPART_FIELD_SIZE,
+  },
 });
+
+const CLEANUP_KEY = Symbol.for("uploadGuards.cleanup");
+
+type CleanupRegistry = { paths: Set<string>; registered: boolean };
+
+function getCleanupRegistry(req: Request): CleanupRegistry {
+  const holder = req as Request & { [CLEANUP_KEY]?: CleanupRegistry };
+  if (!holder[CLEANUP_KEY]) {
+    holder[CLEANUP_KEY] = { paths: new Set(), registered: false };
+  }
+  return holder[CLEANUP_KEY]!;
+}
+
+/**
+ * Registers a temp file for cleanup as soon as it is created. Cleanup runs
+ * when the response finishes/closes, so middleware that rejects before the
+ * route handler (signature checks, idempotency replay) still leaves no temp
+ * files behind. Unlinking is idempotent and safe to call repeatedly.
+ */
+export function registerTempFileCleanup(req: Request, path: string): void {
+  const registry = getCleanupRegistry(req);
+  registry.paths.add(path);
+  if (!registry.registered) {
+    registry.registered = true;
+    const cleanup = () => {
+      for (const p of registry.paths) {
+        fs.unlink(p).catch(() => undefined);
+      }
+      registry.paths.clear();
+    };
+    req.on("close", cleanup);
+    req.on("aborted", cleanup);
+  }
+}
+
+/** Test hook: number of temp files still registered for cleanup on `req`. */
+export function __getRegisteredTempFileCount(req: Request): number {
+  const holder = req as Request & { [CLEANUP_KEY]?: CleanupRegistry };
+  return holder[CLEANUP_KEY]?.paths.size ?? 0;
+}
+
+function unlinkUploadedFiles(req: Request): void {
+  const files: Express.Multer.File[] = [];
+  if (req.file) files.push(req.file);
+  if (Array.isArray(req.files)) {
+    files.push(...(req.files as Express.Multer.File[]));
+  } else if (req.files && typeof req.files === "object") {
+    for (const list of Object.values(req.files)) {
+      files.push(...list);
+    }
+  }
+  for (const file of files) {
+    if (file?.path) {
+      fs.unlink(file.path).catch(() => undefined);
+    }
+  }
+}
 
 /**
  * Wraps `multer().single(field)` and maps multer errors to clear HTTP statuses
@@ -51,6 +121,7 @@ export function singleFileUpload(field = "file"): RequestHandler {
     handler(req, res, (err: unknown) => {
       if (err instanceof MulterError) {
         release();
+        unlinkUploadedFiles(req);
         if (err.code === "LIMIT_FILE_SIZE") {
           next(
             new AppError(
@@ -60,11 +131,43 @@ export function singleFileUpload(field = "file"): RequestHandler {
           );
           return;
         }
+        if (err.code === "LIMIT_FIELD_VALUE") {
+          next(
+            new AppError(
+              "PAYLOAD_TOO_LARGE",
+              `Multipart field exceeds the maximum size of ${MAX_MULTIPART_FIELD_SIZE} bytes`,
+            ),
+          );
+          return;
+        }
+        if (err.code === "LIMIT_FIELD_COUNT") {
+          next(
+            new AppError(
+              "VALIDATION_ERROR",
+              `Too many multipart fields (maximum ${MAX_MULTIPART_FIELDS})`,
+            ),
+          );
+          return;
+        }
+        if (err.code === "LIMIT_PART_COUNT") {
+          next(
+            new AppError(
+              "VALIDATION_ERROR",
+              `Too many multipart parts (maximum ${MAX_MULTIPART_PARTS})`,
+            ),
+          );
+          return;
+        }
+        if (err.code === "LIMIT_FIELD_KEY") {
+          next(new AppError("VALIDATION_ERROR", "Multipart field name is too long"));
+          return;
+        }
         next(new AppError("VALIDATION_ERROR", `Upload error: ${err.message}`));
         return;
       }
       if (err) {
         release();
+        unlinkUploadedFiles(req);
         // Busboy parse failures (malformed multipart) are client errors; system
         // errors such as a full temp disk carry an errno `code` and stay 5xx.
         if (err instanceof Error && !(err as NodeJS.ErrnoException).code) {
@@ -73,6 +176,9 @@ export function singleFileUpload(field = "file"): RequestHandler {
         }
         next(err);
         return;
+      }
+      if (req.file?.path) {
+        registerTempFileCleanup(req, req.file.path);
       }
       next();
     });
@@ -91,6 +197,7 @@ export function validateUploadContentType(req: Request, res: Response, next: Nex
   }
 
   const file = req.file;
+  registerTempFileCleanup(req, file.path);
   fs.readFile(file.path)
     .then((buffer) => {
       const result = validateUpload(buffer, file.mimetype, allowedMimeTypes);

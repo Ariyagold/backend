@@ -10,7 +10,12 @@ import { resources, publishers, payments, moderationEvents } from "../db/schema.
 import { desc, asc, count, and, or, eq, ne, gte, lte, inArray, sql, type SQL } from "drizzle-orm";
 import { getLogger } from "../lib/logger.js";
 import { AppError } from "../lib/errors.js";
-import { adminDelistResource, listVerificationReviewQueue, resolveVerificationReview } from "../services/resourceService.js";
+import {
+  adminDelistResource,
+  adminRestoreResource,
+  listVerificationReviewQueue,
+  resolveVerificationReview,
+} from "../services/resourceService.js";
 import { config } from "../config.js";
 
 const router = Router();
@@ -27,6 +32,95 @@ function adminAuth(req: Request, _res: Response, next: NextFunction) {
     throw new AppError("UNAUTHORIZED", "Unauthorized");
   }
   next();
+}
+
+// ── Query parameter validation policy (#226) ────────────────────────────────
+//
+// Admin endpoints use a strict, explicit query policy:
+//   * Repeated parameters (arrays) and nested objects are ALWAYS rejected
+//     with VALIDATION_ERROR — there is no "first value wins" behaviour.
+//   * Unknown keys are rejected with VALIDATION_ERROR so typos surface
+//     immediately instead of being silently ignored.
+//   * Empty-string values are treated as "absent" for optional filters.
+//
+// Each endpoint declares its allowed key set via `assertQueryKeys` and reads
+// values through the typed helpers below, which enforce the string-only rule.
+
+/** Reject repeated (array) or nested (object) query values for a single key. */
+function assertScalarQuery(value: unknown, name: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (Array.isArray(value)) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      `Invalid ${name}: repeated parameters are not supported; provide a single value`,
+    );
+  }
+  if (typeof value === "object" && value !== null) {
+    throw new AppError("VALIDATION_ERROR", `Invalid ${name}: expected a single string value`);
+  }
+  if (typeof value !== "string") {
+    throw new AppError("VALIDATION_ERROR", `Invalid ${name}: expected a single string value`);
+  }
+  return value;
+}
+
+/** Reject any query key not present in `allowed`. */
+function assertQueryKeys(query: Request["query"], allowed: readonly string[]): void {
+  const allowedSet = new Set(allowed);
+  for (const key of Object.keys(query)) {
+    if (!allowedSet.has(key)) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        `Unknown query parameter '${key}'; allowed: ${allowed.join(", ")}`,
+      );
+    }
+  }
+}
+
+/** Read an optional string query param, enforcing scalar-only semantics. */
+function optionalStringQuery(query: Request["query"], name: string): string | undefined {
+  const raw = assertScalarQuery(query[name], name);
+  if (raw === undefined || raw === "") return undefined;
+  return raw;
+}
+
+/** Parse an optional ISO date query param; throws VALIDATION_ERROR when invalid. */
+function parseDateParam(value: unknown, name: string): Date | undefined {
+  const raw = assertScalarQuery(value, name);
+  if (raw === undefined || raw === "") return undefined;
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new AppError("VALIDATION_ERROR", `Invalid ${name} date`);
+  }
+  return parsed;
+}
+
+/** Parse a strict positive-integer query param; throws VALIDATION_ERROR when invalid. */
+function parsePositiveIntParam(value: unknown, name: string, max: number, fallback: number): number {
+  const raw = assertScalarQuery(value, name);
+  if (raw === undefined || raw === "") return fallback;
+  if (!/^\d+$/.test(raw)) {
+    throw new AppError("VALIDATION_ERROR", `Invalid ${name}: expected an integer 1-${max}`);
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > max) {
+    throw new AppError("VALIDATION_ERROR", `Invalid ${name}: expected an integer 1-${max}`);
+  }
+  return parsed;
+}
+
+/** Parse a strict non-negative-integer query param; throws VALIDATION_ERROR when invalid. */
+function parseNonNegativeIntParam(value: unknown, name: string): number | undefined {
+  const raw = assertScalarQuery(value, name);
+  if (raw === undefined || raw === "") return undefined;
+  if (!/^\d+$/.test(raw)) {
+    throw new AppError("VALIDATION_ERROR", `Invalid ${name}: expected a non-negative integer`);
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new AppError("VALIDATION_ERROR", `Invalid ${name}: expected a non-negative integer`);
+  }
+  return parsed;
 }
 
 /** GET /admin/stats */
@@ -52,14 +146,44 @@ router.post("/admin/delist/:id", adminAuth, async (req, res) => {
   const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() || undefined : undefined;
   // Use a digest of the admin key as the actor identifier so the audit log
   // is attributable without storing the raw key.
-  const rawKey = req.headers["x-admin-key"] as string;
-  const actor = `admin:${createHash("sha256").update(rawKey).digest("hex").slice(0, 12)}`;
+  const actor = adminActor(req);
   const resource = await adminDelistResource(id, { reason, actor });
   if (!resource) {
     throw new AppError("NOT_FOUND", "Resource not found");
   }
   getLogger().warn({ resourceId: id, event: "admin_delist", actor, reason }, "resource delisted by admin");
   res.json({ success: true, id, delistedAt: new Date().toISOString() });
+});
+
+/**
+ * POST /admin/restore/:id — body { reason } (#229)
+ *
+ * Explicit reversal of a mistaken administrative delist. Requires a
+ * non-empty `reason`; the service records an immutable moderation event and
+ * re-checks verification / chain-state eligibility before clearing the
+ * delist flag. Prior moderation history is preserved.
+ */
+router.post("/admin/restore/:id", adminAuth, async (req, res) => {
+  const id = req.params.id as string;
+  const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+  if (!reason) throw new AppError("VALIDATION_ERROR", "reason is required");
+  const actor = adminActor(req);
+  const result = await adminRestoreResource(id, { reason, actor });
+  if (!result.ok) {
+    if (result.error === "not_found") throw new AppError("NOT_FOUND", "Resource not found");
+    if (result.error === "not_delisted") {
+      throw new AppError("CONFLICT", "Resource is not administratively delisted");
+    }
+    if (result.error === "ineligible") {
+      throw new AppError(
+        "FORBIDDEN",
+        "Resource is not eligible for restoration (verification or chain state does not permit relisting)",
+      );
+    }
+    throw new AppError("CONFLICT", "Resource could not be restored");
+  }
+  getLogger().warn({ resourceId: id, event: "admin_restore", actor, reason }, "resource restored by admin");
+  res.json({ success: true, id, status: result.status });
 });
 
 function adminActor(req: Request): string {
@@ -69,8 +193,9 @@ function adminActor(req: Request): string {
 
 /** GET /admin/verification-reviews — queue of low-confidence holds (#188) */
 router.get("/admin/verification-reviews", adminAuth, async (req, res) => {
-  const limit = Math.min(Math.max(Math.trunc(Number(req.query.limit)) || 50, 1), 200);
-  const page = Math.max(Math.trunc(Number(req.query.page)) || 1, 1);
+  assertQueryKeys(req.query, ["limit", "page"]);
+  const limit = parsePositiveIntParam(req.query.limit, "limit", 200, 50);
+  const page = parsePositiveIntParam(req.query.page, "page", Number.MAX_SAFE_INTEGER, 1);
   const entries = await listVerificationReviewQueue(limit, (page - 1) * limit);
   res.json({ page, limit, entries });
 });
@@ -97,44 +222,24 @@ router.post("/admin/verification-reviews/:id/resolve", adminAuth, async (req, re
   res.json({ success: true, id, status: result.status });
 });
 
-/** Parse an optional ISO date query param; throws VALIDATION_ERROR when invalid. */
-function parseDateParam(value: unknown, name: string): Date | undefined {
-  if (value === undefined || value === null || value === "") return undefined;
-  if (typeof value !== "string") {
-    throw new AppError("VALIDATION_ERROR", `Invalid ${name} date`);
-  }
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) {
-    throw new AppError("VALIDATION_ERROR", `Invalid ${name} date`);
-  }
-  return parsed;
-}
-
-/** Parse a strict positive-integer query param; throws VALIDATION_ERROR when invalid. */
-function parsePositiveIntParam(value: unknown, name: string, max: number, fallback: number): number {
-  if (value === undefined || value === null || value === "") return fallback;
-  if (typeof value !== "string" || !/^\d+$/.test(value)) {
-    throw new AppError("VALIDATION_ERROR", `Invalid ${name}: expected an integer 1-${max}`);
-  }
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > max) {
-    throw new AppError("VALIDATION_ERROR", `Invalid ${name}: expected an integer 1-${max}`);
-  }
-  return parsed;
-}
-
-/** GET /admin/audit */
+/**
+ * GET /admin/audit
+ *
+ * Query params (unknown keys rejected):
+ *   resourceId — exact resource id filter
+ *   payer      — exact payer address filter
+ *   from / to  — inclusive ISO-8601 bounds on paidAt
+ *   limit      — 1-200 (default 50)
+ *   page       — >= 1 (default 1)
+ */
 router.get("/admin/audit", adminAuth, async (req, res) => {
+  assertQueryKeys(req.query, ["limit", "page", "resourceId", "payer", "from", "to"]);
   const limit = parsePositiveIntParam(req.query.limit, "limit", 200, 50);
   const page  = parsePositiveIntParam(req.query.page, "page", Number.MAX_SAFE_INTEGER, 1);
   const offset = (page - 1) * limit;
 
-  const resourceId = typeof req.query.resourceId === "string" && req.query.resourceId !== ""
-    ? req.query.resourceId
-    : undefined;
-  const payer = typeof req.query.payer === "string" && req.query.payer !== ""
-    ? req.query.payer
-    : undefined;
+  const resourceId = optionalStringQuery(req.query, "resourceId");
+  const payer = optionalStringQuery(req.query, "payer");
   const from = parseDateParam(req.query.from, "from");
   const to = parseDateParam(req.query.to, "to");
   if (from !== undefined && to !== undefined && from.getTime() > to.getTime()) {
@@ -166,7 +271,7 @@ router.get("/admin/audit", adminAuth, async (req, res) => {
  * `X-Admin-Key` header (same constant-time check as every /admin route);
  * requests without a valid key are rejected with 401 UNAUTHORIZED.
  *
- * Query params:
+ * Query params (unknown keys rejected):
  *   resourceId — exact resource id filter
  *   actor      — exact actor filter (e.g. "admin:<digest>")
  *   from / to  — inclusive ISO-8601 bounds on createdAt
@@ -179,25 +284,14 @@ router.get("/admin/audit", adminAuth, async (req, res) => {
  * callers can paginate without a second request.
  */
 router.get("/admin/moderation-events", adminAuth, async (req, res) => {
-  const limit = Math.min(Math.max(Math.trunc(Number(req.query.limit)) || 50, 1), 200);
-  const page = Math.max(Math.trunc(Number(req.query.page)) || 1, 1);
-  const rawOffset = req.query.offset;
-  let offset: number;
-  if (rawOffset !== undefined && rawOffset !== "") {
-    if (typeof rawOffset !== "string" || !/^\d+$/.test(rawOffset)) {
-      throw new AppError("VALIDATION_ERROR", "Invalid offset: expected a non-negative integer");
-    }
-    offset = Number(rawOffset);
-  } else {
-    offset = (page - 1) * limit;
-  }
+  assertQueryKeys(req.query, ["limit", "page", "offset", "resourceId", "actor", "from", "to"]);
+  const limit = parsePositiveIntParam(req.query.limit, "limit", 200, 50);
+  const page = parsePositiveIntParam(req.query.page, "page", Number.MAX_SAFE_INTEGER, 1);
+  const rawOffset = parseNonNegativeIntParam(req.query.offset, "offset");
+  const offset = rawOffset !== undefined ? rawOffset : (page - 1) * limit;
 
-  const resourceId = typeof req.query.resourceId === "string" && req.query.resourceId !== ""
-    ? req.query.resourceId
-    : undefined;
-  const actor = typeof req.query.actor === "string" && req.query.actor !== ""
-    ? req.query.actor
-    : undefined;
+  const resourceId = optionalStringQuery(req.query, "resourceId");
+  const actor = optionalStringQuery(req.query, "actor");
   const from = parseDateParam(req.query.from, "from");
   const to = parseDateParam(req.query.to, "to");
 
@@ -246,9 +340,9 @@ const MAX_AGE_MINUTES = 525_600;
 
 /** Parse a comma-separated enum list; undefined when absent. */
 function parseEnumList<T extends string>(value: unknown, allowed: readonly T[], name: string): T[] | undefined {
-  if (value === undefined || value === "") return undefined;
-  if (typeof value !== "string") throw new AppError("VALIDATION_ERROR", `Invalid ${name}`);
-  const items = [...new Set(value.split(",").map((v) => v.trim()).filter(Boolean))];
+  const raw = assertScalarQuery(value, name);
+  if (raw === undefined || raw === "") return undefined;
+  const items = [...new Set(raw.split(",").map((v) => v.trim()).filter(Boolean))];
   const bad = items.filter((v) => !(allowed as readonly string[]).includes(v));
   if (items.length === 0 || bad.length > 0) {
     throw new AppError("VALIDATION_ERROR", `Invalid ${name}: expected one or more of ${allowed.join(", ")}`);
@@ -257,17 +351,19 @@ function parseEnumList<T extends string>(value: unknown, allowed: readonly T[], 
 }
 
 function parseMinAgeMinutes(value: unknown): number {
-  if (value === undefined || value === "") return 0;
-  if (typeof value !== "string" || !/^\d+$/.test(value) || Number(value) > MAX_AGE_MINUTES) {
+  const raw = assertScalarQuery(value, "minAgeMinutes");
+  if (raw === undefined || raw === "") return 0;
+  if (!/^\d+$/.test(raw) || Number(raw) > MAX_AGE_MINUTES) {
     throw new AppError("VALIDATION_ERROR", `Invalid minAgeMinutes: expected an integer 0-${MAX_AGE_MINUTES}`);
   }
-  return Number(value);
+  return Number(raw);
 }
 
 /**
  * GET /admin/payments/exceptions
  *
- * Reconciliation view of payments that need recovery. Filters:
+ * Reconciliation view of payments that need recovery. Query params
+ * (unknown keys rejected):
  *   settlement     — comma list of pending|settled|failed
  *   delivery       — comma list of delivered|undelivered
  *   minAgeMinutes  — only rows paid at least this long ago (default 0)
@@ -278,10 +374,11 @@ function parseMinAgeMinutes(value: unknown): number {
  * (not just the returned page) so operators can size the backlog.
  */
 router.get("/admin/payments/exceptions", adminAuth, async (req, res) => {
+  assertQueryKeys(req.query, ["settlement", "delivery", "minAgeMinutes", "limit"]);
   const settlement = parseEnumList(req.query.settlement, SETTLEMENT_STATES, "settlement");
   const delivery = parseEnumList(req.query.delivery, DELIVERY_STATES, "delivery");
   const minAgeMinutes = parseMinAgeMinutes(req.query.minAgeMinutes);
-  const limit = Math.min(Math.max(Math.trunc(Number(req.query.limit)) || 50, 1), EXCEPTION_MAX_LIMIT);
+  const limit = parsePositiveIntParam(req.query.limit, "limit", EXCEPTION_MAX_LIMIT, 50);
 
   const now = new Date();
   const cutoff = new Date(now.getTime() - minAgeMinutes * 60_000);

@@ -73,6 +73,43 @@ export const transferOwnershipSchema = z
   })
   .strict();
 
+/**
+ * Shared query-parameter validation policy (#226).
+ *
+ * Express parses query strings with the `qs` library, so a repeated parameter
+ * (`?foo=a&foo=b`) arrives as an array and a bracketed parameter
+ * (`?foo[bar]=baz`) arrives as an object. Both are ambiguous for single-valued
+ * filters, so every single-valued query param is validated with
+ * {@link strictQueryString}, which rejects arrays and objects instead of
+ * silently ignoring them.
+ *
+ * Unknown keys are rejected per endpoint: `catalogQuerySchema` and
+ * `adminAuditQuerySchema` are both `.strict()`, so any unrecognised key is a
+ * validation error rather than being dropped.
+ *
+ * Repeated parameters: only the catalog `tags` filter accepts repeated values
+ * (`?tags=a&tags=b`, equivalent to `?tags=a,b`). Every other query parameter
+ * rejects arrays.
+ */
+export const strictQueryString = (schema: z.ZodString = z.string()) =>
+  z.union([schema, z.array(z.unknown()), z.record(z.string(), z.unknown())]).transform((value, ctx) => {
+    if (Array.isArray(value)) {
+      ctx.addIssue({
+        code: "custom",
+        message: "must be a single value; repeated parameters are not supported",
+      });
+      return z.NEVER;
+    }
+    if (typeof value === "object" && value !== null) {
+      ctx.addIssue({
+        code: "custom",
+        message: "must be a single value; object parameters are not supported",
+      });
+      return z.NEVER;
+    }
+    return value as string;
+  });
+
 /** Sort values supported by GET /resources (#163). */
 export const catalogSortValues = ["newest", "price_asc", "price_desc", "title"] as const;
 
@@ -158,28 +195,32 @@ export const updateWebhookConfigSchema = z
   .strict()
   .refine((body) => Object.keys(body).length > 0, { message: "At least one field is required" });
 
+/**
+ * Query params for GET /resources (public catalog).
+ *
+ * Unknown keys are rejected (`.strict()`). All params except `tags` are
+ * single-valued: repeated parameters (`?search=a&search=b`) and object
+ * parameters (`?search[x]=a`) are rejected. `tags` is the only param that
+ * accepts repeated values (`?tags=a&tags=b`), which is equivalent to the
+ * comma-separated form (`?tags=a,b`).
+ */
 export const catalogQuerySchema = z
   .object({
-    verificationStatus: z.enum(["verified", "pending", "rejected"]).optional(),
-    minPrice: z
-      .string()
-      .regex(/^\d+(\.\d+)?$/, "must be a non-negative number")
-      .optional(),
-    maxPrice: z
-      .string()
-      .regex(/^\d+(\.\d+)?$/, "must be a non-negative number")
-      .optional(),
-    search: z.string().optional(),
-    resourceType: z.enum(["file", "link"]).optional(),
-    owner: z.string().optional(),
-    sort: z.enum(catalogSortValues).optional(),
+    verificationStatus: strictQueryString(z.enum(["verified", "pending", "rejected"])).optional(),
+    minPrice: strictQueryString(z.string().regex(/^\d+(\.\d+)?$/, "must be a non-negative number")).optional(),
+    maxPrice: strictQueryString(z.string().regex(/^\d+(\.\d+)?$/, "must be a non-negative number")).optional(),
+    search: strictQueryString().optional(),
+    resourceType: strictQueryString(z.enum(["file", "link"])).optional(),
+    owner: strictQueryString().optional(),
+    sort: strictQueryString(z.enum(catalogSortValues)).optional(),
     /**
      * Exact-match tag filter (#222). Comma-separated or repeated values;
      * multiple tags are combined with AND semantics (all must be present).
+     * This is the only catalog param that accepts repeated values.
      */
     tags: catalogTagsSchema.optional(),
-    limit: z.coerce.number().int().min(1).max(CATALOG_MAX_LIMIT).optional(),
-    offset: z.coerce.number().int().min(0).optional(),
+    limit: strictQueryString(z.string().regex(/^\d+$/)).transform((value) => Number(value)).pipe(z.number().int().min(1).max(CATALOG_MAX_LIMIT)).optional(),
+    offset: strictQueryString(z.string().regex(/^\d+$/)).transform((value) => Number(value)).pipe(z.number().int().min(0)).optional(),
   })
   .strict()
   .refine(
@@ -219,13 +260,17 @@ const strictPositiveIntString = (max?: number) => {
  * `1e3`, `+1` or `abc` that permissive Number coercion would accept). `from`
  * and `to` are optional ISO date strings; an inverted range (`from > to`) is
  * rejected. The existing resource/payer/date filters from #111 are preserved.
+ *
+ * Unknown keys are rejected (`.strict()`). Every param is single-valued:
+ * repeated parameters (`?page=1&page=2`) and object parameters
+ * (`?page[x]=1`) are rejected (#226).
  */
 export const adminAuditQuerySchema = z
   .object({
-    page: strictPositiveIntString().optional(),
-    limit: strictPositiveIntString(ADMIN_AUDIT_MAX_LIMIT).optional(),
-    from: z.iso.datetime({ offset: true }).optional(),
-    to: z.iso.datetime({ offset: true }).optional(),
+    page: strictQueryString(strictPositiveIntString()).optional(),
+    limit: strictQueryString(strictPositiveIntString(ADMIN_AUDIT_MAX_LIMIT)).optional(),
+    from: strictQueryString(z.iso.datetime({ offset: true })).optional(),
+    to: strictQueryString(z.iso.datetime({ offset: true })).optional(),
   })
   .strict()
   .refine(
@@ -240,3 +285,11 @@ export const adminAuditQuerySchema = z
       path: ["from"],
     },
   );
+
+/**
+ * Alias for {@link adminAuditQuerySchema} used by admin routes (#226).
+ *
+ * Admin endpoints reject unknown keys and repeated/object parameters; see
+ * {@link strictQueryString} for the shared policy.
+ */
+export const adminQuerySchema = adminAuditQuerySchema;

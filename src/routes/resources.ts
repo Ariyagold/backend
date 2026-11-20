@@ -15,6 +15,7 @@ import {
   prepareOwnershipSchema,
   transferOwnershipSchema,
   CATALOG_DEFAULT_LIMIT,
+  validateQuery,
 } from "../schemas/requests.js";
 import { dynamicPaywall } from "../middleware/dynamicPaywall.js";
 import {
@@ -321,12 +322,30 @@ router.post(
 //   X-Total-Count, X-Limit, X-Offset, X-Next-Offset (omitted on the last page)
 //
 // Sorting (#163): `sort` accepts newest (default), price_asc, price_desc, title.
+//
+// Query validation policy (#226):
+//   - Repeated parameters are rejected with VALIDATION_ERROR, except `tags`,
+//     which is repeatable and ANDed: `?tags=art&tags=music`.
+//   - Array/object syntax (e.g. `?limit[]=5`, `?filter[x]=y`) is rejected.
+//   - Unknown query keys are rejected rather than silently ignored.
+//   Examples:
+//     GET /resources?tags=art&tags=music   → 200 (both tags required)
+//     GET /resources?limit=5&limit=10      → 400 VALIDATION_ERROR
+//     GET /resources?limit[]=5             → 400 VALIDATION_ERROR
+//     GET /resources?unknown=1             → 400 VALIDATION_ERROR
 router.get("/resources", async (req, res) => {
-  const parsed = catalogQuerySchema.safeParse(req.query);
+  // Query validation policy (#226): repeated/array/object values are rejected
+  // with VALIDATION_ERROR, except `tags` which is documented as repeatable
+  // (`?tags=a&tags=b`). Unknown keys are rejected rather than silently ignored.
+  const parsed = validateQuery(catalogQuerySchema, req.query, {
+    repeatable: ["tags"],
+    unknownKeys: "reject",
+  });
   if (!parsed.success) {
     throw new AppError(
       "VALIDATION_ERROR",
       parsed.error.issues[0]?.message ?? "Invalid query params",
+      { detail: parsed.error.format() },
     );
   }
 
