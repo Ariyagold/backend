@@ -51,6 +51,12 @@ export const thumbnailStatusEnum = pgEnum("thumbnail_status_enum", [
   "failed",
 ]);
 
+export const resourceScanStatusEnum = pgEnum("resource_scan_status", [
+  "pending",
+  "clean",
+  "infected",
+]);
+
 // Publishers — humans or AI agents that publish resources
 export const publishers = pgTable(
   "publishers",
@@ -117,6 +123,8 @@ export const resources = pgTable(
     contentHash: text("content_hash"),
     externalUrl: text("external_url"),
     mimeType: text("mime_type"),
+    // Files remain unavailable until a configured scanner marks them clean.
+    scanStatus: resourceScanStatusEnum("scan_status").notNull().default("pending"),
     // Retained object size in bytes (#234). Persisted so per-publisher storage
     // quota accounting can be reconciled against actual stored objects.
     sizeBytes: integer("size_bytes"),
@@ -189,6 +197,38 @@ export const resources = pgTable(
     sizeBytesNonNegative: check(
       "resources_size_bytes_nonneg",
       sql`${table.sizeBytes} IS NULL OR ${table.sizeBytes} >= 0`,
+    ),
+  }),
+);
+
+// Durable antivirus scan jobs. Pending jobs survive process restarts and keep
+// retry scheduling state in Postgres.
+export const resourceScanJobs = pgTable(
+  "resource_scan_jobs",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => createId()),
+    resourceId: text("resource_id")
+      .notNull()
+      .unique()
+      .references(() => resources.id, { onDelete: "cascade" }),
+    status: text("status").notNull().default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    lastError: text("last_error"),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).defaultNow().notNull(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    statusNextIdx: index("idx_resource_scan_jobs_status_next").on(
+      table.status,
+      table.nextAttemptAt,
+    ),
+    attemptsNonNegative: check("resource_scan_jobs_attempts_nonneg", sql`${table.attempts} >= 0`),
+    statusValid: check(
+      "resource_scan_jobs_status_valid",
+      sql`${table.status} IN ('pending', 'completed')`,
     ),
   }),
 );
