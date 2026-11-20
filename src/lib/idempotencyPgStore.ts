@@ -5,6 +5,9 @@ import type { IdempotencyRecord, IdempotencyStore } from "./idempotency.js";
 // different replica sees the original result instead of creating a duplicate.
 // The in-memory store in idempotency.ts remains the default (and is what most
 // tests use).
+//
+// Expired rows are also removed by a background sweep (#173): get(key) alone
+// only cleans up keys a client happens to retry, leaving abandoned keys behind.
 
 export interface IdempotencyRow {
   record: IdempotencyRecord;
@@ -24,6 +27,13 @@ export interface IdempotencyRowStore {
   upsert(key: string, record: IdempotencyRecord, expiresAt: Date): Promise<void>;
   remove(key: string): Promise<void>;
   removeAll(): Promise<void>;
+  /**
+   * Deletes at most `batchSize` rows already expired according to the
+   * database's clock and returns how many were deleted. Rows that are still
+   * live (or have no expiry yet) are never touched, so active reservations and
+   * unexpired completed responses survive the sweep (#173).
+   */
+  deleteExpired(batchSize: number): Promise<number>;
 }
 
 // Minimal shape of the postgres.js tagged-template client.
@@ -65,6 +75,25 @@ export function createPostgresRowStore(sql: PgSql): IdempotencyRowStore {
     },
     async removeAll() {
       await sql`DELETE FROM idempotency_records`;
+    },
+    async deleteExpired(batchSize) {
+      // Postgres has no DELETE ... LIMIT, so the bounded set of keys is picked
+      // in a subquery. `expires_at < now()` uses the database's own clock (as
+      // insertIfAbsent does) and the idx_idempotency_records_expires_at index;
+      // SKIP LOCKED keeps the sweep from blocking a request that is writing one
+      // of the candidate rows. Only rows past their expiry are returned, so
+      // live reservations and unexpired results stay intact (#173).
+      const rows = await sql`
+        DELETE FROM idempotency_records
+        WHERE key IN (
+          SELECT key FROM idempotency_records
+          WHERE expires_at < now()
+          ORDER BY expires_at
+          LIMIT ${batchSize}
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING key`;
+      return rows.length;
     },
   };
 }

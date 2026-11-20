@@ -1,8 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
+  createPostgresRowStore,
   createSharedIdempotencyStore,
   type IdempotencyRow,
   type IdempotencyRowStore,
+  type PgSql,
 } from "./idempotencyPgStore.js";
 
 // A fake "database" shared by several store instances (simulating replicas).
@@ -29,6 +31,14 @@ function fakeDatabase(now: () => number = Date.now): IdempotencyRowStore {
     },
     async removeAll() {
       table.clear();
+    },
+    async deleteExpired(batchSize) {
+      const expired = [...table.entries()]
+        .filter(([, row]) => row.expiresAt.getTime() < now())
+        .sort(([, a], [, b]) => a.expiresAt.getTime() - b.expiresAt.getTime())
+        .slice(0, batchSize);
+      for (const [key] of expired) table.delete(key);
+      return expired.length;
     },
   };
 }
@@ -97,5 +107,28 @@ describe("shared idempotency store", () => {
     expect(await s.reserve("k", { inProgress: true, fingerprint: "fp" })).toBeUndefined();
     t += 200;
     expect(await s.reserve("k", { inProgress: true, fingerprint: "fp2" })).toBeUndefined();
+  });
+});
+
+describe("Postgres row store expiry sweep (#173)", () => {
+  it("deletes expired rows in one bounded statement using the database clock", async () => {
+    const queries: Array<{ text: string; values: unknown[] }> = [];
+    const sql: PgSql = async (strings, ...values) => {
+      queries.push({ text: strings.join("?"), values });
+      return [{ key: "expired-1" }, { key: "expired-2" }];
+    };
+
+    const deleted = await createPostgresRowStore(sql).deleteExpired(25);
+
+    expect(deleted).toBe(2);
+    expect(queries).toHaveLength(1);
+    const [query] = queries;
+    expect(query?.values).toEqual([25]);
+    expect(query?.text).toContain("DELETE FROM idempotency_records");
+    expect(query?.text).toContain("WHERE expires_at < now()");
+    expect(query?.text).toContain("ORDER BY expires_at");
+    expect(query?.text).toContain("LIMIT ?");
+    expect(query?.text).toContain("FOR UPDATE SKIP LOCKED");
+    expect(query?.text).toContain("RETURNING key");
   });
 });

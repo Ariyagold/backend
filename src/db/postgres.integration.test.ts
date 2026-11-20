@@ -73,4 +73,35 @@ describe("Postgres integration", () => {
     });
     await rows.remove(key);
   });
+
+  it("sweeps expired rows in bounded batches without touching live records (#173)", async () => {
+    const expiredKeys = Array.from({ length: 5 }, () => `integration-expired-${randomUUID()}`);
+    const liveReservation = `integration-live-reservation-${randomUUID()}`;
+    const liveResult = `integration-live-result-${randomUUID()}`;
+
+    try {
+      for (const key of expiredKeys) {
+        await client`
+          INSERT INTO idempotency_records (key, record, expires_at)
+          VALUES (${key}, '{"inProgress":true,"fingerprint":"old"}', now() - interval '1 second')
+        `;
+      }
+      await client`
+        INSERT INTO idempotency_records (key, record, expires_at) VALUES
+          (${liveReservation}, '{"inProgress":true,"fingerprint":"live"}', now() + interval '1 hour'),
+          (${liveResult}, '{"inProgress":false,"fingerprint":"live","result":{"status":201,"body":{}}}', now() + interval '1 hour')
+      `;
+
+      expect(await rows.deleteExpired(2)).toBe(2);
+      expect(await rows.deleteExpired(2)).toBe(2);
+      expect(await rows.deleteExpired(2)).toBe(1);
+      expect(await rows.deleteExpired(2)).toBe(0);
+
+      for (const key of expiredKeys) expect(await rows.select(key)).toBeUndefined();
+      expect((await rows.select(liveReservation))?.record.inProgress).toBe(true);
+      expect((await rows.select(liveResult))?.record.inProgress).toBe(false);
+    } finally {
+      await client`DELETE FROM idempotency_records WHERE key = ANY(${[...expiredKeys, liveReservation, liveResult]})`;
+    }
+  });
 });
