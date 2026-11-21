@@ -263,6 +263,11 @@ export const envSchema = z.object({
   SUPABASE_URL: httpUrl("SUPABASE_URL"),
   SUPABASE_SERVICE_KEY: z.string().min(1, "SUPABASE_SERVICE_KEY is required"),
   SUPABASE_STORAGE_BUCKET: z.string().default("resources"),
+  // When set, uploaded files are sent as application/octet-stream to this
+  // scanner endpoint, which returns JSON { "verdict": "clean" | "infected" }.
+  FILE_SCANNER_URL: z.string().url().optional(),
+  FILE_SCANNER_API_KEY: z.string().optional(),
+  FILE_SCANNER_TIMEOUT_MS: z.coerce.number().int().min(1).max(600000).default(30000),
 
   // Limits
   MAX_FILE_SIZE_MB: z.coerce.number().int().min(1).max(10240).default(50),
